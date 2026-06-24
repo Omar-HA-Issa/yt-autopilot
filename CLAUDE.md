@@ -88,7 +88,7 @@ all live in `chrome.storage.local`, never in page-local JS variables.
   chrome://extensions, confirm it installs with zero errors on
   youtube.com. Don't skip — isolates plumbing bugs from logic bugs.
 
-- [ ] **Phase 1 — Scraping.** Content script reads the subscriptions
+- [x] **Phase 1 — Scraping.** Content script reads the subscriptions
   feed / homepage DOM, extracts `{title, channel, videoId}` per visible
   video card into a `getCandidates()` function. Console-log and verify
   clean output before moving on.
