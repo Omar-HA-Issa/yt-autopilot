@@ -3,7 +3,7 @@
   "name": "yt-autopilot",
   "version": "0.1.0",
   "description": "Spotify DJ for your YouTube subscriptions feed.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "activeTab"],
   "host_permissions": ["https://www.youtube.com/*"],
   "background": {
     "service_worker": "background.js"
