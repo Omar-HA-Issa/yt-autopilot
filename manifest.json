@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "yt-autopilot",
+  "version": "0.1.0",
+  "description": "Spotify DJ for your YouTube subscriptions feed.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://www.youtube.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "yt-autopilot"
+  }
+}
