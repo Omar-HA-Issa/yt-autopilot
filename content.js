@@ -89,7 +89,8 @@ async function pickNext() {
   const pool = candidates.filter(c => !seen.has(c.videoId));
   const finalPool = pool.length > 0 ? pool : candidates; // reset if all seen
 
-  const pick = finalPool[Math.floor(Math.random() * finalPool.length)];
+  const scores = (await getStored('ytap_channel_scores')) || {};
+  const pick = weightedPick(finalPool, scores);
   await addToRecentPicks(pick.videoId);
 
   console.log('[yt-autopilot] picked:', pick, '| pool:', finalPool.length, '/', candidates.length);
@@ -113,6 +114,28 @@ async function popFromHistory() {
   const [prev, ...rest] = history;
   await setStored({ ytap_history: rest });
   return prev;
+}
+
+// ─── Channel scoring (Phase 4) ───────────────────────────────────────────────
+
+async function updateChannelScore(channel, signal) {
+  const α = 0.1;
+  const scores = (await getStored('ytap_channel_scores')) || {};
+  const prev = scores[channel] ?? 0.5;
+  scores[channel] = prev * (1 - α) + signal * α;
+  await setStored({ ytap_channel_scores: scores });
+  console.log('[yt-autopilot] channel score update:', channel, prev.toFixed(3), '→', scores[channel].toFixed(3), '(signal', signal, ')');
+}
+
+function weightedPick(pool, scores) {
+  const weights = pool.map(c => scores[c.channel] ?? 0.5);
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < pool.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return pool[i];
+  }
+  return pool[pool.length - 1];
 }
 
 // ─── Overlay (Phase 3b/3c/3d) ────────────────────────────────────────────────
@@ -175,8 +198,10 @@ async function injectOverlay(video) {
 
   overlay.querySelector('#ytap-skip').addEventListener('click', async () => {
     const elapsed = video.currentTime - videoStartTime;
-    await setStored({ ytap_last_skip_elapsed: elapsed });
     console.log('[yt-autopilot] skip clicked after', Math.round(elapsed), 's');
+    const watchPct = video.duration > 0 ? elapsed / video.duration : 0;
+    const signal = watchPct >= 0.4 ? 1.0 : 0.0;
+    await updateChannelScore(current.channel, signal);
     await pushToHistory(current);
     const pick = await pickNext();
     if (pick) {
@@ -257,6 +282,7 @@ async function onVideoEnded() {
   await waitForAdToFinish();
 
   const current = (await getStored('ytap_current')) || {};
+  await updateChannelScore(current.channel, 1.0);
   await pushToHistory(current);
 
   const pick = await pickNext();
@@ -305,7 +331,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'PICK_NEXT') {
     console.log('[yt-autopilot] PICK_NEXT received');
     pickNext().then(async pick => {
-      sendResponse({ pick }); // respond before navigating so the channel doesn't error
+      try { sendResponse({ pick }); } catch (_) {}
       if (pick) {
         await setStored({ ytap_current: pick });
         console.log('[yt-autopilot] navigating to first pick:', pick.videoId);
@@ -313,7 +339,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
     }).catch(err => {
       console.error('[yt-autopilot] PICK_NEXT error:', err);
-      sendResponse({ pick: null });
+      try { sendResponse({ pick: null }); } catch (_) {}
     });
     return true; // keep channel open for async response
   }
