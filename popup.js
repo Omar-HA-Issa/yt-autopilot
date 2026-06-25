@@ -13,7 +13,7 @@ btn.addEventListener('click', () => {
 
     if (next) {
       chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
-        chrome.tabs.sendMessage(tab.id, { type: 'PICK_NEXT' });
+        chrome.tabs.sendMessage(tab.id, { type: 'PICK_NEXT' }, () => void chrome.runtime.lastError);
       });
     }
   });

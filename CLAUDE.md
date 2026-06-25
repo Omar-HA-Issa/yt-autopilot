@@ -98,7 +98,7 @@ all live in `chrome.storage.local`, never in page-local JS variables.
   weighted-random over the remainder (recency-only, no embeddings yet).
   Trigger manually from the popup, confirm sane non-repeating picks.
 
-- [ ] **Phase 3 — Playback controls + autoplay loop.** On pick: navigate
+- [x] **Phase 3 — Playback controls + autoplay loop.** On pick: navigate
   to video, autoplay, inject an overlay positioned top-left on the page,
   visually styled in the spirit of Spotify DJ's now-playing card —
   including a small animated/moving graphic element (e.g. a pulsing
@@ -119,6 +119,9 @@ all live in `chrome.storage.local`, never in page-local JS variables.
     candidate and repeat. This is the highest-engineering-risk phase —
     state-across-navigation, queue history (for Back), live player sync
     (for Pause/Play), and playback monitoring all live here.
+  - Note: overlay positioning and visual polish deferred to Phase 6.
+    Post-roll ads are handled — navigation waits for `.ad-showing` to
+    clear before advancing.
 
 - [ ] **Phase 4 — Signal feedback.** Wire watched/skipped events into a
   per-channel score in storage (EMA update, see persistence rules above).
