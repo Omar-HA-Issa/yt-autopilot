@@ -1,1 +1,124 @@
 /* Styles for the in-page overlay injected by content.js. */
+
+#ytap-overlay {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  z-index: 2147483647;
+  background: rgba(18, 18, 18, 0.92);
+  color: #fff;
+  border-radius: 14px;
+  padding: 14px 16px 12px;
+  min-width: 230px;
+  max-width: 300px;
+  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
+  font-size: 13px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  user-select: none;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* ── Top row: visualizer + meta ── */
+
+#ytap-overlay .ytap-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ── Visualizer bars ── */
+
+.ytap-visualizer {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 22px;
+  flex-shrink: 0;
+}
+
+.ytap-visualizer span {
+  display: block;
+  width: 3px;
+  border-radius: 2px;
+  background: #ff4444;
+  height: 4px;
+}
+
+/* Bars only animate when the overlay has .playing */
+#ytap-overlay.playing .ytap-visualizer span {
+  animation: ytap-bar linear infinite alternate;
+}
+
+#ytap-overlay.playing .ytap-visualizer span:nth-child(1) { animation-duration: 0.6s; animation-delay: 0.0s; }
+#ytap-overlay.playing .ytap-visualizer span:nth-child(2) { animation-duration: 0.8s; animation-delay: 0.2s; }
+#ytap-overlay.playing .ytap-visualizer span:nth-child(3) { animation-duration: 0.5s; animation-delay: 0.1s; }
+#ytap-overlay.playing .ytap-visualizer span:nth-child(4) { animation-duration: 0.9s; animation-delay: 0.3s; }
+#ytap-overlay.playing .ytap-visualizer span:nth-child(5) { animation-duration: 0.7s; animation-delay: 0.05s; }
+
+@keyframes ytap-bar {
+  from { height: 3px;  }
+  to   { height: 22px; }
+}
+
+/* ── Meta text ── */
+
+#ytap-overlay .ytap-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  overflow: hidden;
+}
+
+#ytap-overlay .ytap-channel {
+  font-size: 10px;
+  color: #aaa;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#ytap-overlay .ytap-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ── Controls ── */
+
+#ytap-overlay .ytap-controls {
+  display: flex;
+  gap: 6px;
+}
+
+#ytap-overlay button {
+  background: rgba(255, 255, 255, 0.1);
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: background 0.15s;
+  flex: 1;
+  white-space: nowrap;
+}
+
+#ytap-overlay button:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+#ytap-overlay button:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
