@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "yt-autopilot",
+  "name": "YouTube Autopilot",
   "version": "0.1.0",
   "description": "Spotify DJ for your YouTube subscriptions feed.",
   "permissions": ["storage", "activeTab"],
