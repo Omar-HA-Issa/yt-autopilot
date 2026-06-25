@@ -28,6 +28,17 @@ function getCandidates() {
   return candidates;
 }
 
+// ─── Tab identity ─────────────────────────────────────────────────────────────
+
+function getMyTabId() {
+  return new Promise(resolve => {
+    chrome.runtime.sendMessage({ type: 'GET_TAB_ID' }, res => {
+      void chrome.runtime.lastError;
+      resolve(res?.tabId ?? null);
+    });
+  });
+}
+
 // ─── Storage helpers ──────────────────────────────────────────────────────────
 
 const RECENT_PICKS_MAX = 25;
@@ -175,9 +186,17 @@ async function injectOverlay(video) {
   });
 }
 
-// Remove overlay when Stop is clicked in the popup
+// Remove overlay when DJ stops or another tab claims the DJ
 chrome.storage.onChanged.addListener((changes) => {
-  if (changes.running && !changes.running.newValue) removeOverlay();
+  if (changes.running && !changes.running.newValue) {
+    removeOverlay();
+    return;
+  }
+  if (changes.djTabId) {
+    getMyTabId().then(myTabId => {
+      if (changes.djTabId.newValue !== myTabId) removeOverlay();
+    });
+  }
 });
 
 // ─── Autoplay loop (Phase 3a) ─────────────────────────────────────────────────
@@ -225,8 +244,13 @@ function waitForAdToFinish() {
 async function onVideoEnded() {
   console.log('[yt-autopilot] video ended, picking next');
   if (!chrome.runtime?.id) { console.log('[yt-autopilot] extension context lost — refresh the tab'); return; }
-  const running = await getStored('running');
-  if (!running) { console.log('[yt-autopilot] DJ stopped, not advancing'); return; }
+  const [running, djTabId, myTabId] = await Promise.all([
+    getStored('running'),
+    getStored('djTabId'),
+    getMyTabId(),
+  ]);
+  if (!running)            { console.log('[yt-autopilot] DJ stopped, not advancing'); return; }
+  if (djTabId !== myTabId) { console.log('[yt-autopilot] not the DJ tab, not advancing'); return; }
 
   // Give YouTube ~400ms to start a post-roll ad before we check
   await new Promise(r => setTimeout(r, 400));
@@ -249,8 +273,13 @@ async function initAutoplay() {
   if (autoplayActive) { console.log('[yt-autopilot] initAutoplay: init in progress, skip'); return; }
   if (location.pathname !== '/watch') { console.log('[yt-autopilot] initAutoplay: not a watch page, skip'); return; }
 
-  const running = await getStored('running');
-  if (!running) { console.log('[yt-autopilot] initAutoplay: DJ not running, skip'); return; }
+  const [running, djTabId, myTabId] = await Promise.all([
+    getStored('running'),
+    getStored('djTabId'),
+    getMyTabId(),
+  ]);
+  if (!running)            { console.log('[yt-autopilot] initAutoplay: DJ not running, skip'); return; }
+  if (djTabId !== myTabId) { console.log('[yt-autopilot] initAutoplay: not the DJ tab, skip'); return; }
 
   console.log('[yt-autopilot] initAutoplay: starting on', url);
   autoplayActive = true;

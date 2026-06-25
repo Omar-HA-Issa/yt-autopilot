@@ -1,20 +1,36 @@
 // Popup — Start/Stop control only.
 const btn = document.getElementById('toggleBtn');
 
-chrome.storage.local.get('running', ({ running }) => {
-  btn.textContent = running ? 'Stop' : 'Start';
-});
+// Wrap everything in the tab query so tabId is always known before we wire the button.
+chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+  const tabId = tab.id;
 
-btn.addEventListener('click', () => {
-  chrome.storage.local.get('running', ({ running }) => {
-    const next = !running;
-    chrome.storage.local.set({ running: next });
-    btn.textContent = next ? 'Stop' : 'Start';
+  chrome.storage.local.get(['running', 'djTabId'], ({ running, djTabId }) => {
+    const isDJHere = running && djTabId === tabId;
+    btn.textContent = isDJHere ? 'Stop DJ' : 'Start DJ';
+    btn.className   = isDJHere ? 'stop'    : 'start';
+  });
 
-    if (next) {
-      chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
-        chrome.tabs.sendMessage(tab.id, { type: 'PICK_NEXT' }, () => void chrome.runtime.lastError);
-      });
-    }
+  btn.addEventListener('click', () => {
+    chrome.storage.local.get(['running', 'djTabId'], ({ running, djTabId }) => {
+      const isDJHere = running && djTabId === tabId;
+
+      if (!isDJHere) {
+        // Start DJ in this tab — clear stale state first
+        chrome.storage.local.remove('recentPicks', () => {
+          chrome.storage.local.set({ running: true, djTabId: tabId }, () => {
+            chrome.tabs.sendMessage(tabId, { type: 'PICK_NEXT' }, () => {
+              void chrome.runtime.lastError;
+              window.close();
+            });
+          });
+        });
+      } else {
+        // Stop DJ
+        chrome.storage.local.set({ running: false });
+        chrome.storage.local.remove('djTabId');
+        window.close();
+      }
+    });
   });
 });

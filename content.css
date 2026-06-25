@@ -2,8 +2,8 @@
 
 #ytap-overlay {
   position: fixed;
-  top: 16px;
-  left: 16px;
+  bottom: 16px;
+  right: 16px;
   z-index: 2147483647;
   background: rgba(18, 18, 18, 0.92);
   color: #fff;

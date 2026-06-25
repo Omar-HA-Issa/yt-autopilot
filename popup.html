@@ -2,25 +2,51 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>yt-autopilot</title>
   <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      width: 200px;
-      padding: 16px;
-      font-family: sans-serif;
-      text-align: center;
+      width: 220px;
+      background: #0f0f0f;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      padding: 20px 16px;
     }
-    button {
+    .logo {
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .logo-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #ff0000;
+    }
+    #toggleBtn {
       width: 100%;
-      padding: 10px;
+      padding: 12px;
+      border: none;
+      border-radius: 8px;
       font-size: 14px;
+      font-weight: 600;
       cursor: pointer;
+      letter-spacing: 0.3px;
     }
+    #toggleBtn:hover { opacity: 0.85; }
+    #toggleBtn.start { background: #ff0000; color: #fff; }
+    #toggleBtn.stop  { background: #272727; color: #aaa; }
   </style>
 </head>
 <body>
-  <button id="toggleBtn">Start</button>
+  <div class="logo">
+    <div class="logo-dot"></div>
+    YouTube Autopilot
+  </div>
+  <button id="toggleBtn" class="start">Start DJ</button>
   <script src="popup.js"></script>
 </body>
 </html>
