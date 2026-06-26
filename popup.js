@@ -17,7 +17,7 @@ chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
 
       if (!isDJHere) {
         // Start DJ in this tab — clear stale state first
-        chrome.storage.local.remove('recentPicks', () => {
+        chrome.storage.local.remove(['recentPicks', 'ytap_current_segment'], () => {
           chrome.storage.local.set({ running: true, djTabId: tabId }, () => {
             chrome.tabs.sendMessage(tabId, { type: 'PICK_NEXT' }, () => {
               void chrome.runtime.lastError;

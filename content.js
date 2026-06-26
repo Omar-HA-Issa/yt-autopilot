@@ -64,17 +64,130 @@ function addToRecentPicks(videoId) {
   });
 }
 
+// ─── Embedder (5a) ────────────────────────────────────────────────────────────
+// Embedding runs in background.js (extension-origin service worker) to avoid
+// YouTube's page CSP blocking Workers created from content script context.
+
+async function embedTexts(texts, timeoutMs = 30000) {
+  const embedPromise = new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ type: 'EMBED', texts }, (response) => {
+      if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+      if (response?.error) return reject(new Error(response.error));
+      resolve(response?.embeddings ?? null);
+    });
+  });
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('embedTexts timeout')), timeoutMs)
+  );
+  return Promise.race([embedPromise, timeoutPromise])
+    .catch(err => { console.warn('[yt-autopilot] embedTexts failed:', err.message); return null; });
+}
+
+// ─── Taste profile (5b) ───────────────────────────────────────────────────────
+
+const EMBED_DIM   = 384;
+const TASTE_ALPHA = 0.15; // higher than channel α — topical taste drifts faster
+
+function cosineSim(a, b) {
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot  += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(magA) * Math.sqrt(magB);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+async function updateTasteVector(embedding) {
+  if (!embedding || embedding.length !== EMBED_DIM) return;
+  const stored = (await getStored('ytap_taste_vector')) || new Array(EMBED_DIM).fill(0);
+  const updated = stored.map((v, i) => v * (1 - TASTE_ALPHA) + embedding[i] * TASTE_ALPHA);
+  const mag = Math.sqrt(updated.reduce((s, x) => s + x * x, 0));
+  const normalized = mag > 0 ? updated.map(x => x / mag) : updated;
+  await setStored({ ytap_taste_vector: normalized });
+}
+
+function blendedWeight(channelScore, embedding, tasteVector) {
+  if (!tasteVector || !embedding) return channelScore;
+  const simNorm = (cosineSim(embedding, tasteVector) + 1) / 2; // [-1,1] → [0,1]
+  return 0.4 * channelScore + 0.6 * simNorm;
+}
+
+function embedCandidatesAsync(candidates) {
+  // Fire and forget — offscreen document embeds and writes to storage directly.
+  // No response expected so page navigation doesn't break anything.
+  chrome.runtime.sendMessage({ type: 'EMBED_AND_STORE', candidates }, () => {
+    void chrome.runtime.lastError;
+  });
+}
+
+// ─── Segment logic (5c) ──────────────────────────────────────────────────────
+
+const SEGMENT_SIZE  = 3;
+const SIM_THRESHOLD = 0.2;
+
+function formSegment(pool, scores, tasteVector) {
+  const anchor = weightedPick(pool, scores, tasteVector);
+  const segment = [anchor];
+  const rest = pool.filter(c => c.videoId !== anchor.videoId);
+
+  const withEmbed = rest.filter(c => c.embedding);
+  if (anchor.embedding && withEmbed.length > 0) {
+    const ranked = withEmbed
+      .map(c => ({ ...c, _sim: cosineSim(c.embedding, anchor.embedding) }))
+      .filter(c => c._sim >= SIM_THRESHOLD)
+      .sort((a, b) => b._sim - a._sim);
+
+    while (segment.length < SEGMENT_SIZE && ranked.length) {
+      const next = ranked.shift();
+      delete next._sim;
+      segment.push(next);
+    }
+  }
+
+  const topic = typeof YTAP_CLASSIFY !== 'undefined'
+    ? YTAP_CLASSIFY(segment.map(c => c.title))
+    : 'general';
+
+  console.log('[yt-autopilot] formSegment topic:', topic, segment.map(v => v.title));
+  return { topic, videos: segment };
+}
+
+async function willStartNewSegment() {
+  const seg = await getStored('ytap_current_segment');
+  return !seg || seg.segmentIndex >= seg.videos.length;
+}
+
 // ─── Pick logic ───────────────────────────────────────────────────────────────
 
 async function pickNext() {
+  // Drain the current segment before forming a new one.
+  const seg = await getStored('ytap_current_segment');
+  if (seg && seg.segmentIndex < seg.videos.length) {
+    const pick = seg.videos[seg.segmentIndex];
+    await setStored({ ytap_current_segment: { ...seg, segmentIndex: seg.segmentIndex + 1 } });
+    console.log('[yt-autopilot] segment drain [', seg.segmentIndex + 1, '/', seg.videos.length, ']', seg.topic, pick.title);
+    await addToRecentPicks(pick.videoId);
+    return pick;
+  }
+
+  // Segment exhausted or none — build a new one.
   let candidates = getCandidates();
+
+  if (!candidates.length && location.pathname !== '/watch') {
+    for (let i = 0; i < 5 && !candidates.length; i++) {
+      await new Promise(r => setTimeout(r, 800));
+      candidates = getCandidates();
+    }
+  }
+
   console.log('[yt-autopilot] getCandidates() returned', candidates.length, 'on', location.pathname);
 
   if (candidates.length) {
-    // On a feed page — save the fresh pool for use on watch pages
     await setStored({ ytap_candidates: candidates });
+    embedCandidatesAsync(candidates);
   } else {
-    // On a watch page — use the saved pool from the last feed visit
     candidates = (await getStored('ytap_candidates')) || [];
     console.log('[yt-autopilot] using stored candidates:', candidates.length);
   }
@@ -87,13 +200,18 @@ async function pickNext() {
   const recentPicks = await getRecentPicks();
   const seen = new Set(recentPicks);
   const pool = candidates.filter(c => !seen.has(c.videoId));
-  const finalPool = pool.length > 0 ? pool : candidates; // reset if all seen
+  const finalPool = pool.length > 0 ? pool : candidates;
 
   const scores = (await getStored('ytap_channel_scores')) || {};
-  const pick = weightedPick(finalPool, scores);
-  await addToRecentPicks(pick.videoId);
+  const tasteVector = (await getStored('ytap_taste_vector')) || null;
+  const newSeg = formSegment(finalPool, scores, tasteVector);
 
-  console.log('[yt-autopilot] picked:', pick, '| pool:', finalPool.length, '/', candidates.length);
+  // Save segment with index at 1 — returning index 0 now.
+  await setStored({ ytap_current_segment: { ...newSeg, segmentIndex: 1 } });
+
+  const pick = newSeg.videos[0];
+  await addToRecentPicks(pick.videoId);
+  console.log('[yt-autopilot] new segment:', newSeg.topic, '— first pick:', pick.title);
   return pick;
 }
 
@@ -125,10 +243,18 @@ async function updateChannelScore(channel, signal) {
   scores[channel] = prev * (1 - α) + signal * α;
   await setStored({ ytap_channel_scores: scores });
   console.log('[yt-autopilot] channel score update:', channel, prev.toFixed(3), '→', scores[channel].toFixed(3), '(signal', signal, ')');
+
+  if (signal === 1.0) {
+    const current = (await getStored('ytap_current')) || {};
+    if (current.embedding) {
+      await updateTasteVector(current.embedding);
+      console.log('[yt-autopilot] taste vector updated from:', current.title);
+    }
+  }
 }
 
-function weightedPick(pool, scores) {
-  const weights = pool.map(c => scores[c.channel] ?? 0.5);
+function weightedPick(pool, scores, tasteVector) {
+  const weights = pool.map(c => blendedWeight(scores[c.channel] ?? 0.5, c.embedding ?? null, tasteVector));
   const total = weights.reduce((a, b) => a + b, 0);
   let r = Math.random() * total;
   for (let i = 0; i < pool.length; i++) {
@@ -281,12 +407,20 @@ async function onVideoEnded() {
   await new Promise(r => setTimeout(r, 400));
   await waitForAdToFinish();
 
+  // Check segment state BEFORE pickNext() modifies it.
+  const isSegmentBoundary = await willStartNewSegment();
+
   const current = (await getStored('ytap_current')) || {};
   await updateChannelScore(current.channel, 1.0);
   await pushToHistory(current);
 
   const pick = await pickNext();
   if (pick) {
+    if (isSegmentBoundary) {
+      const newSeg = await getStored('ytap_current_segment');
+      console.log('[yt-autopilot] segment boundary → new topic:', newSeg?.topic || 'general');
+      // Phase 5e: await playNarration(newSeg.topic) goes here
+    }
     await setStored({ ytap_current: pick });
     console.log('[yt-autopilot] navigating to', pick.videoId);
     window.location.href = `https://www.youtube.com/watch?v=${pick.videoId}`;
@@ -345,8 +479,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 });
 
+// ─── Feed scraping (proactive embed) ─────────────────────────────────────────
+// Runs on home/subscriptions pages so embeddings are ready before a pick is needed.
+
+function scrapeAndEmbedIfFeed() {
+  if (location.pathname === '/watch') return;
+  // Feed pages need a moment to render cards
+  setTimeout(async () => {
+    const candidates = getCandidates();
+    if (!candidates.length) return;
+    await setStored({ ytap_candidates: candidates });
+    embedCandidatesAsync(candidates);
+    console.log('[yt-autopilot] feed scrape:', candidates.length, 'candidates queued for embedding');
+  }, 1500);
+}
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
+scrapeAndEmbedIfFeed();
 initAutoplay();
 
 // Re-init after YouTube SPA navigation — only when the URL actually changed
@@ -355,5 +505,6 @@ document.addEventListener('yt-navigate-finish', () => {
   console.log('[yt-autopilot] yt-navigate-finish', url);
   if (url === autoplayInitUrl) { console.log('[yt-autopilot] same URL, skipping re-init'); return; }
   autoplayActive = false;
+  scrapeAndEmbedIfFeed();
   initAutoplay();
 });
