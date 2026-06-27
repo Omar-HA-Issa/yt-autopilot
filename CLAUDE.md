@@ -91,10 +91,12 @@ yt-autopilot/
 - `running` — boolean, is the DJ active
 - `djTabId` — tab ID that owns the current DJ session
 - `recentPicks` — array of videoIds, cleared each session (anti-repeat)
-- `ytap_candidates` — candidate pool scraped from the feed, reused on watch pages
+- `ytap_candidates` — candidate pool `{title, channel, videoId, embedding?}[]`, scraped from feed and reused on watch pages; embeddings written back async by offscreen document
 - `ytap_current` — current video object `{title, channel, videoId}`
 - `ytap_history` — back-stack of played videos (max 50)
 - `ytap_channel_scores` — `{channelName: score}` taste profile, persists forever
+- `ytap_taste_vector` — `number[384]` EMA of watched-video embeddings, persists forever, null until first natural video end
+- `ytap_current_segment` — `{topic: string, videos: VideoObj[], segmentIndex: number}`, cleared on DJ session start
 
 Key architectural fact: since there's no OAuth/API, almost all real logic
 lives in `content.js` (it has eyes on the DOM). `background.js` stays thin.
@@ -138,33 +140,43 @@ all live in `chrome.storage.local`, never in page-local JS variables.
   `ytap_channel_scores`. This is the point where it's a genuinely
   different product from "shuffle."
 
-- [ ] **Phase 5 — NLP layer + vibe-block narration.** Topic classification
-  is the foundation for narration, not an optional add-on to it — so
-  these are now one phase, fully sequential after 1-4.
-  - **NLP/clustering core:** Client-side embeddings (transformers.js) on
-    candidate titles. Replace recency-only weighting with
-    similarity-to-taste-profile weighting. Cluster candidates into
-    segments of ~3-4 topically-similar videos.
-  - **Narration: lookup, not generation.** No TTS, no LLM, no dynamically
-    generated speech — avoids the TTS uncanny-valley problem (robotic
-    reads, mangled channel names/acronyms) and avoids an LLM API
-    dependency. A human (you, a friend, or a cheap Fiverr voice actor)
-    pre-records ~100-150 short, energetic lines ahead of time. The
-    system's only job is classifying which topic bucket the current
-    segment falls into (via the embeddings above — e.g. gaming, finance,
-    history, comedy — not duration or frequency), then randomly picking
-    one matching pre-recorded file so the same line doesn't play every
-    time a given topic recurs.
-  - Mapping table: topic bucket → list of candidate MP3 filenames
-  - Audio playback layer: play the matched clip once at segment start,
-    sequenced before/under the video's own audio — separate plumbing
-    from controlling video playback (that's Phase 3)
-  - New asset pipeline: recording/commissioning, naming convention,
-    bundling ~100-150 audio files into the extension package
-  - Note: recording/writing lines can happen in parallel with earlier
-    coding phases, but the classification logic cannot ship before this
-    phase's embeddings exist. Skip the narration half entirely if 1-4
-    already feel good enough without it — it's polish, not core.
+- [x] **Phase 5a — transformers.js integration.** Offscreen document
+  architecture (content script → background → offscreen) runs
+  `all-MiniLM-L6-v2` (quantized, 22MB, bundled in repo). Model files
+  committed under `models/Xenova/all-MiniLM-L6-v2/`. WASM + transformers
+  bundle copied to extension root via `scripts/setup_assets.js`.
+  `embedCandidatesAsync()` fires from `pickNext()` — fire-and-forget,
+  offscreen embeds all candidates and background writes embeddings back
+  into `ytap_candidates`. No user-visible latency.
+
+- [x] **Phase 5b — embedding-based candidate weighting.** Taste vector
+  (`ytap_taste_vector`, 384-float, EMA α=0.15) updated on every natural
+  video end. Pick weight = `0.4 × channel_EMA + 0.6 × cosine_sim_to_taste`.
+  Graceful degradation: falls back to channel-score-only when embeddings
+  aren't ready yet.
+
+- [x] **Phase 5c — clustering + topic taxonomy.** `topic_classifier.js`
+  provides `YTAP_CLASSIFY(titles[]) → string` via keyword matching across
+  10 buckets (gaming, tech, finance, science, history, comedy, music,
+  sports, food, pop_culture) + general fallback. `formSegment()` picks an
+  anchor via blended weighting, then fills up to 3 videos by cosine
+  similarity to the anchor (threshold 0.2). `ytap_current_segment`
+  persists the active segment across page navigations. `pickNext()` drains
+  the current segment before forming a new one. Segment boundary logged on
+  natural video end — narration call placeholder in place for 5e.
+  Feed pages proactively scrape + embed candidates via
+  `scrapeAndEmbedIfFeed()` so embeddings are ready before the DJ starts.
+
+- [ ] **Phase 5d — audio asset pipeline.** Write ~100-150 narration lines
+  across 10 topic buckets + general. Generate MP3s via ElevenLabs
+  (pre-generated, no runtime API calls). Bundle under `audio/{topic}/`.
+  `narration_manifest.js` content script exposes `YTAP_NARRATION` mapping
+  table. Naming: `{3-char-abbrev}{nn}.mp3` (e.g. `gam01.mp3`, `his03.mp3`).
+
+- [ ] **Phase 5e — narration playback.** `playNarration(topic)` fires at
+  segment boundaries (natural end only, not skip). Awaited before
+  navigation — 8s hard cap. Anti-repeat: avoids replaying the same clip
+  back-to-back. Autoplay policy failures silently skip narration.
 
 - [ ] **Phase 6 — Polish + share.** Narration template variety (avoid
   repetitive phrasing), minimal styling pass, test with 2-3 friends

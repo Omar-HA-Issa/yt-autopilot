@@ -39,6 +39,16 @@
     #toggleBtn:hover { opacity: 0.85; }
     #toggleBtn.start { background: #ff0000; color: #fff; }
     #toggleBtn.stop  { background: #272727; color: #aaa; }
+    #resetBtn {
+      display: block;
+      text-align: center;
+      margin-top: 12px;
+      font-size: 11px;
+      color: #444;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    #resetBtn:hover { color: #888; }
   </style>
 </head>
 <body>
@@ -47,6 +57,7 @@
     YouTube Autopilot
   </div>
   <button id="toggleBtn" class="start">Start DJ</button>
+  <a id="resetBtn">Reset taste profile</a>
   <script src="popup.js"></script>
 </body>
 </html>

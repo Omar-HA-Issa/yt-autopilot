@@ -3,15 +3,36 @@
   "name": "YouTube Autopilot",
   "version": "0.1.0",
   "description": "Spotify DJ for your YouTube subscriptions feed.",
-  "permissions": ["storage", "activeTab"],
+  "permissions": ["storage", "activeTab", "offscreen"],
   "host_permissions": ["https://www.youtube.com/*"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval';"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "transformers.min.js",
+        "ort-wasm-simd-threaded.wasm",
+        "ort-wasm-simd.wasm",
+        "ort-wasm-threaded.wasm",
+        "ort-wasm.wasm",
+        "models/Xenova/all-MiniLM-L6-v2/config.json",
+        "models/Xenova/all-MiniLM-L6-v2/tokenizer.json",
+        "models/Xenova/all-MiniLM-L6-v2/tokenizer_config.json",
+        "models/Xenova/all-MiniLM-L6-v2/special_tokens_map.json",
+        "models/Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx",
+        "audio/*/*.mp3"
+      ],
+      "matches": ["https://www.youtube.com/*"]
+    }
+  ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
       "matches": ["https://www.youtube.com/*"],
-      "js": ["content.js"],
+      "js": ["topic_classifier.js", "narration_manifest.js", "content.js"],
       "css": ["content.css"]
     }
   ],
