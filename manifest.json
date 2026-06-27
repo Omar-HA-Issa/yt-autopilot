@@ -20,7 +20,8 @@
         "models/Xenova/all-MiniLM-L6-v2/tokenizer.json",
         "models/Xenova/all-MiniLM-L6-v2/tokenizer_config.json",
         "models/Xenova/all-MiniLM-L6-v2/special_tokens_map.json",
-        "models/Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx"
+        "models/Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx",
+        "audio/*/*.mp3"
       ],
       "matches": ["https://www.youtube.com/*"]
     }
@@ -31,7 +32,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.youtube.com/*"],
-      "js": ["topic_classifier.js", "content.js"],
+      "js": ["topic_classifier.js", "narration_manifest.js", "content.js"],
       "css": ["content.css"]
     }
   ],

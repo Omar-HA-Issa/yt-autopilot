@@ -3,12 +3,49 @@ console.log('[yt-autopilot] content script loaded', location.href);
 
 // ─── Scraping ─────────────────────────────────────────────────────────────────
 
+const MIN_DURATION_SEC = 300; // 5 minutes
+
+const NEWS_PATTERNS = [
+  'breaking news', 'breaking:', '| breaking', 'live news', 'live stream',
+  '| live', 'watch live', 'live coverage', 'live update', 'news update',
+  'press conference', 'full press', 'full speech', 'raw video',
+];
+
+function parseDuration(text) {
+  if (!text) return null;
+  const t = text.trim();
+  if (t === 'LIVE' || t === 'SHORTS' || t === '') return null;
+  const parts = t.split(':').map(Number);
+  if (parts.length < 2 || parts.some(isNaN)) return null;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return null;
+}
+
+function parseViews(text) {
+  if (!text) return 0;
+  const m = text.replace(/,/g, '').match(/([\d.]+)\s*([KMBkmb]?)\s*views?/i);
+  if (!m) return 0;
+  const n = parseFloat(m[1]);
+  const s = m[2].toUpperCase();
+  if (s === 'B') return n * 1e9;
+  if (s === 'M') return n * 1e6;
+  if (s === 'K') return n * 1e3;
+  return n;
+}
+
+const MIN_VIEWS_HARD = 20000; // absolute floor — filters out the truly niche
+
 function getCandidates() {
-  const cards = document.querySelectorAll('ytd-rich-item-renderer, ytd-video-renderer');
+  const cards = document.querySelectorAll(
+    'ytd-rich-item-renderer, ytd-video-renderer, ytd-compact-video-renderer'
+  );
   const candidates = [];
 
   for (const card of cards) {
-    const titleEl = card.querySelector('a.ytLockupMetadataViewModelTitle');
+    // Feed pages use ytLockupMetadataViewModelTitle; sidebar uses a#video-title
+    const titleEl = card.querySelector('a.ytLockupMetadataViewModelTitle') ||
+                    card.querySelector('a#video-title[href*="watch?v="]');
     if (!titleEl) continue;
 
     const match = (titleEl.href || '').match(/[?&]v=([^&]+)/);
@@ -19,10 +56,32 @@ function getCandidates() {
     if (!title) continue;
 
     const channelEl = card.querySelector('a[href*="/@"]');
-    if (!channelEl) continue; // skips sponsored cards
+    if (!channelEl) continue;
     const channel = channelEl.textContent.trim();
 
-    candidates.push({ title, channel, videoId });
+    // Skip live streams and shorts via overlay badge
+    const overlayEl = card.querySelector('ytd-thumbnail-overlay-time-status-renderer');
+    const overlayStyle = overlayEl?.getAttribute('overlay-style') || '';
+    if (overlayStyle === 'LIVE' || overlayStyle === 'SHORTS') continue;
+
+    // Skip short videos (< 5 min)
+    const timeEl = card.querySelector('ytd-thumbnail-overlay-time-status-renderer yt-formatted-string') ||
+                   card.querySelector('ytd-thumbnail-overlay-time-status-renderer span#text') ||
+                   card.querySelector('ytd-thumbnail-overlay-time-status-renderer span');
+    const duration = parseDuration(timeEl?.textContent);
+    if (duration === null || duration < MIN_DURATION_SEC) continue;
+
+    // Skip news-style titles
+    const titleLower = title.toLowerCase();
+    if (NEWS_PATTERNS.some(p => titleLower.includes(p))) continue;
+
+    // Extract view count for weighting and hard filtering
+    const viewEl = card.querySelector('#metadata-line span.inline-metadata-item') ||
+                   card.querySelector('ytd-video-meta-block span');
+    const views = parseViews(viewEl?.textContent);
+    if (views < MIN_VIEWS_HARD) continue;
+
+    candidates.push({ title, channel, videoId, views });
   }
 
   return candidates;
@@ -185,11 +244,20 @@ async function pickNext() {
   console.log('[yt-autopilot] getCandidates() returned', candidates.length, 'on', location.pathname);
 
   if (candidates.length) {
-    await setStored({ ytap_candidates: candidates });
-    embedCandidatesAsync(candidates);
+    // Merge with stored pool — keep embeddings, drop stale no-views entries, cap at 100
+    const prev = (await getStored('ytap_candidates')) || [];
+    const prevById = Object.fromEntries(prev.map(c => [c.videoId, c]));
+    const freshWithEmbed = candidates.map(c => ({ ...c, embedding: prevById[c.videoId]?.embedding }));
+    const newIds = new Set(candidates.map(c => c.videoId));
+    const retained = prev.filter(c => !newIds.has(c.videoId) && (c.views ?? 0) >= MIN_VIEWS_HARD);
+    const merged = [...freshWithEmbed, ...retained].slice(0, 100);
+    await setStored({ ytap_candidates: merged });
+    embedCandidatesAsync(freshWithEmbed.filter(c => !c.embedding));
+    candidates = merged;
   } else {
-    candidates = (await getStored('ytap_candidates')) || [];
-    console.log('[yt-autopilot] using stored candidates:', candidates.length);
+    const raw = (await getStored('ytap_candidates')) || [];
+    candidates = raw.filter(c => (c.views ?? 0) >= MIN_VIEWS_HARD);
+    console.log('[yt-autopilot] using stored candidates:', candidates.length, '(filtered from', raw.length, ')');
   }
 
   if (!candidates.length) {
@@ -197,9 +265,19 @@ async function pickNext() {
     return null;
   }
 
-  const recentPicks = await getRecentPicks();
-  const seen = new Set(recentPicks);
-  const pool = candidates.filter(c => !seen.has(c.videoId));
+  let recentPicks = await getRecentPicks();
+  let seen = new Set(recentPicks);
+  let pool = candidates.filter(c => !seen.has(c.videoId));
+
+  if (pool.length === 0) {
+    // All candidates seen — keep only last 5 to avoid immediate repeats
+    recentPicks = recentPicks.slice(0, 5);
+    await setStored({ recentPicks });
+    seen = new Set(recentPicks);
+    pool = candidates.filter(c => !seen.has(c.videoId));
+    console.log('[yt-autopilot] recentPicks reset — pool refreshed to', pool.length);
+  }
+
   const finalPool = pool.length > 0 ? pool : candidates;
 
   const scores = (await getStored('ytap_channel_scores')) || {};
@@ -254,7 +332,18 @@ async function updateChannelScore(channel, signal) {
 }
 
 function weightedPick(pool, scores, tasteVector) {
-  const weights = pool.map(c => blendedWeight(scores[c.channel] ?? 0.5, c.embedding ?? null, tasteVector));
+  // Log-normalize view counts across the pool so a 10M video isn't 10000x a 1K video
+  const logViews = pool.map(c => Math.log10((c.views || 0) + 1));
+  const maxLog = Math.max(...logViews);
+  const minLog = Math.min(...logViews);
+  const logRange = maxLog - minLog || 1;
+
+  const weights = pool.map((c, i) => {
+    const base = blendedWeight(scores[c.channel] ?? 0.5, c.embedding ?? null, tasteVector);
+    const viewScore = (logViews[i] - minLog) / logRange;
+    return 0.85 * base + 0.15 * viewScore;
+  });
+
   const total = weights.reduce((a, b) => a + b, 0);
   let r = Math.random() * total;
   for (let i = 0; i < pool.length; i++) {
@@ -262,6 +351,35 @@ function weightedPick(pool, scores, tasteVector) {
     if (r <= 0) return pool[i];
   }
   return pool[pool.length - 1];
+}
+
+// ─── Narration (Phase 5e) ─────────────────────────────────────────────────────
+
+let _lastNarrationClip = null;
+
+async function playNarration(topic) {
+  if (typeof YTAP_NARRATION === 'undefined') return;
+  const clips = YTAP_NARRATION[topic] || YTAP_NARRATION['general'];
+  if (!clips?.length) return;
+
+  const pool = clips.length > 1 ? clips.filter(c => c !== _lastNarrationClip) : clips;
+  const clip = pool[Math.floor(Math.random() * pool.length)];
+  _lastNarrationClip = clip;
+
+  const audio = new Audio(chrome.runtime.getURL(`audio/${topic}/${clip}`));
+  console.log('[yt-autopilot] narration:', topic, clip);
+
+  await new Promise(resolve => {
+    const timer = setTimeout(resolve, 8000);
+    const done  = () => { clearTimeout(timer); resolve(); };
+    audio.addEventListener('ended', done, { once: true });
+    audio.addEventListener('error', done, { once: true });
+    audio.play().catch(err => {
+      console.log('[yt-autopilot] narration autoplay blocked:', err.message);
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 // ─── Overlay (Phase 3b/3c/3d) ────────────────────────────────────────────────
@@ -418,8 +536,9 @@ async function onVideoEnded() {
   if (pick) {
     if (isSegmentBoundary) {
       const newSeg = await getStored('ytap_current_segment');
-      console.log('[yt-autopilot] segment boundary → new topic:', newSeg?.topic || 'general');
-      // Phase 5e: await playNarration(newSeg.topic) goes here
+      const topic  = newSeg?.topic || 'general';
+      console.log('[yt-autopilot] segment boundary → new topic:', topic);
+      await playNarration(topic);
     }
     await setStored({ ytap_current: pick });
     console.log('[yt-autopilot] navigating to', pick.videoId);
@@ -467,6 +586,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     pickNext().then(async pick => {
       try { sendResponse({ pick }); } catch (_) {}
       if (pick) {
+        await playNarration('intro');
+        await new Promise(r => setTimeout(r, 1000));
+        const firstSeg = await getStored('ytap_current_segment');
+        if (firstSeg?.topic) await playNarration(firstSeg.topic);
         await setStored({ ytap_current: pick });
         console.log('[yt-autopilot] navigating to first pick:', pick.videoId);
         window.location.href = `https://www.youtube.com/watch?v=${pick.videoId}`;
@@ -488,14 +611,29 @@ function scrapeAndEmbedIfFeed() {
   setTimeout(async () => {
     const candidates = getCandidates();
     if (!candidates.length) return;
-    await setStored({ ytap_candidates: candidates });
-    embedCandidatesAsync(candidates);
-    console.log('[yt-autopilot] feed scrape:', candidates.length, 'candidates queued for embedding');
+    const prev = (await getStored('ytap_candidates')) || [];
+    const prevById = Object.fromEntries(prev.map(c => [c.videoId, c]));
+    const freshWithEmbed = candidates.map(c => ({ ...c, embedding: prevById[c.videoId]?.embedding }));
+    const newIds = new Set(candidates.map(c => c.videoId));
+    const retained = prev.filter(c => !newIds.has(c.videoId) && (c.views ?? 0) >= MIN_VIEWS_HARD);
+    const merged = [...freshWithEmbed, ...retained].slice(0, 100);
+    await setStored({ ytap_candidates: merged });
+    embedCandidatesAsync(freshWithEmbed.filter(c => !c.embedding));
+    console.log('[yt-autopilot] feed scrape:', candidates.length, 'fresh +', retained.length, 'retained =', merged.length, 'total');
   }, 1500);
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
+function warmNarrationIntro() {
+  if (typeof YTAP_NARRATION === 'undefined') return;
+  for (const clip of (YTAP_NARRATION['intro'] || [])) {
+    const a = new Audio(chrome.runtime.getURL(`audio/intro/${clip}`));
+    a.load();
+  }
+}
+
+warmNarrationIntro();
 scrapeAndEmbedIfFeed();
 initAutoplay();
 
