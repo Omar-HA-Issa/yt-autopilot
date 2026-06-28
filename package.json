@@ -7,6 +7,7 @@
   "scripts": {
     "setup": "node scripts/setup_assets.js",
     "download-model": "node scripts/download_model.js",
-    "gen-narration": "node scripts/generate_narration.js"
+    "gen-narration": "node scripts/generate_narration.js",
+    "gen-centroids": "node scripts/generate_centroids.js"
   }
 }
