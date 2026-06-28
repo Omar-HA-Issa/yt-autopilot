@@ -44,17 +44,16 @@ const _YTAP_TAXONOMY = {
                 'ocean', 'marine', 'ecology', 'environment', 'particle', 'relativity',
                 'scientific', 'anatomy', 'surgery', 'disease', 'cancer', 'stem cell'],
 
-  history:     ['history', 'historical', 'ancient', 'medieval', ' war', 'empire',
-                'documentary', 'revolution', ' century', 'president',
-                'wwii', 'ww2', 'ww1', 'wwi', 'world war', 'roman', 'viking', 'cold war',
+  history:     ['history', 'historical', ' war', 'empire',
+                'documentary history', 'revolution', ' century', 'historical figure',
+                'wwii', 'ww2', 'ww1', 'wwi', 'world war', 'cold war',
                 'dynasty', 'battle of ', 'battle at ', 'great battle', 'famous battle',
-                'general ', 'colonel', 'siege', 'troops', 'buried',
-                'genocide', 'massacre', 'holocaust', 'atrocity', 'overthrew', 'overthrow',
+                'colonel', 'siege', 'troops',
+                'genocide', 'massacre', 'atrocity', 'overthrew', 'overthrow',
                 'coup', 'assassination', 'assassin', 'colonial', 'colonialism', 'slavery',
-                'enslaved', 'uprising', 'rebellion', 'propaganda', 'archive', 'kingdom',
+                'enslaved', 'uprising', 'rebellion', 'archive', 'kingdom',
                 'monarchy', 'treaty', 'occupation', 'resistance', 'historical drama',
-                'true crime', 'investigation', 'government', 'military history',
-                'rise and fall', 'fall of', 'rise of', 'untold story', 'dark history'],
+                'military history', 'historical documentary'],
 
   comedy:      ['funny', 'comedy', 'humor', 'laugh', 'joke', 'hilarious', 'meme', 'prank',
                 'sketch', 'parody', 'roast', 'stand-up', 'standup', 'fails', ' lol',
@@ -94,12 +93,13 @@ const _YTAP_TAXONOMY = {
                 'cinematic', 'plot twist', 'ending explained', 'movie review', 'film review',
                 'show review', 'animated film', 'documentary film', 'short film'],
 
-  commentary:  ['exposed', 'cancelled', 'cancel', 'viral', 'influencer', 'drama', 'controversy',
-                'video essay', 'deep dive', 'iceberg', 'tier list', 'ranked', 'podcast',
+  commentary:  ['exposed', 'cancelled', 'cancel', 'viral', 'influencer', 'youtube drama',
+                'creator drama', 'internet drama', 'drama', 'controversy',
+                'video essay', 'deep dive', 'iceberg', 'podcast',
                 'commentary', ' rant', 'responding to', 'my response', 'hot take',
-                'unpopular opinion', 'reaction', 'celebrity', 'gossip', 'interview',
-                'talk show', 'late night', 'tiktok', 'explained', 'breakdown', 'dissecting',
-                'roast', 'callout', 'supercut', 'compilation of', 'worst of', 'best of'],
+                'unpopular opinion', 'reaction video', 'reacting to', 'callout',
+                'tiktok drama', 'exposing', 'the truth about', 'why i left',
+                'what happened to', 'the problem with', 'we need to talk about'],
 };
 
 function YTAP_CLASSIFY(titles) {
@@ -115,4 +115,18 @@ function YTAP_CLASSIFY(titles) {
   }
   const best = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
   return best[1] > 0 ? best[0] : 'general';
+}
+
+// Embedding-based classifier — uses pre-computed topic centroid vectors (topic_centroids.js).
+// Both the candidate embedding and centroids are L2-normalized, so cosine sim = dot product.
+// Falls back to null if centroids aren't loaded yet.
+function YTAP_CLASSIFY_VEC(vector) {
+  if (typeof YTAP_TOPIC_CENTROIDS === 'undefined' || !vector) return null;
+  let best = 'general', bestSim = -Infinity;
+  for (const [topic, centroid] of Object.entries(YTAP_TOPIC_CENTROIDS)) {
+    let sim = 0;
+    for (let i = 0; i < vector.length; i++) sim += vector[i] * centroid[i];
+    if (sim > bestSim) { bestSim = sim; best = topic; }
+  }
+  return best;
 }

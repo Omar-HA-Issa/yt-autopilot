@@ -2,7 +2,7 @@
 const btn = document.getElementById('toggleBtn');
 
 document.getElementById('resetBtn').addEventListener('click', () => {
-  chrome.storage.local.remove(['ytap_channel_scores', 'ytap_taste_vector', 'ytap_candidates'], () => {
+  chrome.storage.local.remove(['ytap_channel_scores', 'ytap_taste_vectors', 'ytap_taste_watch_counts', 'ytap_candidates', 'ytap_last_segment_topic'], () => {
     window.close();
   });
 });
@@ -23,7 +23,7 @@ chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
 
       if (!isDJHere) {
         // Start DJ — clear session state, gently decay channel scores toward neutral
-        chrome.storage.local.remove(['recentPicks', 'ytap_current_segment'], () => {
+        chrome.storage.local.remove(['recentPicks', 'ytap_current_segment', 'ytap_last_segment_topic'], () => {
           chrome.storage.local.get('ytap_channel_scores', ({ ytap_channel_scores }) => {
             const scores = ytap_channel_scores || {};
             const decayed = Object.fromEntries(
