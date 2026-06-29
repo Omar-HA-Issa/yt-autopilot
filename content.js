@@ -482,6 +482,8 @@ async function playNarration(topic) {
 
   const audio = new Audio(chrome.runtime.getURL(`audio/${topic}/${clip}`));
   _currentNarrationAudio = audio;
+  connectNarrationToAnalyser(audio);     // wire into DJ splash analyser if active
+  connectNarrationToNarrAnalyser(audio); // wire into segment narration analyser if active
   console.log('[yt-autopilot] narration:', topic, clip);
 
   await new Promise(resolve => {
@@ -498,6 +500,277 @@ async function playNarration(topic) {
       resolve();
     });
   });
+}
+
+// ─── DJ circle UI ────────────────────────────────────────────────────────────
+
+let _djSplashAnimId = null;
+let _djAudioCtx     = null;
+let _djAnalyser     = null;
+let _djFreqData     = null;
+
+// Called from playNarration() — connects the live Audio element into the
+// analyser so the blob ring reacts to the actual audio waveform.
+function connectNarrationToAnalyser(audioEl) {
+  if (!_djAnalyser || !_djAudioCtx) return;
+  try {
+    if (_djAudioCtx.state === 'suspended') _djAudioCtx.resume();
+    const src = _djAudioCtx.createMediaElementSource(audioEl);
+    src.connect(_djAnalyser);
+  } catch (e) {
+    console.log('[yt-autopilot] analyser connect failed:', e.message);
+  }
+}
+
+function showDJSplash() {
+  if (document.getElementById('ytap-dj-splash')) return;
+
+  // Set up Web Audio analyser — failure is non-fatal, blob still runs on harmonics
+  try {
+    _djAudioCtx = new AudioContext();
+    _djAnalyser = _djAudioCtx.createAnalyser();
+    _djAnalyser.fftSize = 256;               // 128 frequency bins
+    _djAnalyser.smoothingTimeConstant = 0.82; // temporal smoothing built-in
+    _djAnalyser.connect(_djAudioCtx.destination);
+    _djFreqData = new Uint8Array(_djAnalyser.frequencyBinCount); // 128 values, 0–255
+  } catch (e) {
+    console.log('[yt-autopilot] AudioContext init failed:', e.message);
+  }
+
+  const card = document.createElement('div');
+  card.id = 'ytap-dj-splash';
+  document.body.appendChild(card);
+
+  // ── Blob ring constants ──────────────────────────────────────────────────
+  const SIZE      = 140;
+  const CX        = SIZE / 2, CY = SIZE / 2;
+  const R         = 48;          // base radius (px)
+  const N         = 120;         // sample points around the perimeter
+  const AMP_BASE  = R * 0.08;   // harmonic perturbation max (~3.8px)
+  const AMP_AUDIO = R * 0.22;   // audio-driven perturbation max (~10.6px)
+  const BINS_USED = 64;          // use the lower 64 bins (covers 0–5.5kHz, speech range)
+
+  // Slow organic harmonics — keep the ring alive even during silence
+  const H = [
+    { k: 2, w: 0.40, phase: 0.00, speed:  0.90 },
+    { k: 3, w: 0.30, phase: 1.20, speed: -0.60 },
+    { k: 4, w: 0.20, phase: 2.50, speed:  0.40 },
+    { k: 5, w: 0.10, phase: 4.00, speed: -0.70 },
+  ];
+  const totalW = H.reduce((s, h) => s + h.w, 0);
+  H.forEach(h => { h.a = (h.w / totalW) * AMP_BASE; });
+
+  const NS  = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('width',    SIZE);
+  svg.setAttribute('height',   SIZE);
+  svg.setAttribute('viewBox',  `0 0 ${SIZE} ${SIZE}`);
+  svg.setAttribute('overflow', 'visible'); // let glow bleed outside SVG bounds
+
+  const blob = document.createElementNS(NS, 'path');
+  blob.setAttribute('fill',            'none');
+  blob.setAttribute('stroke',          '#a8c7fa');
+  blob.setAttribute('stroke-width',    '4.0');
+  blob.setAttribute('stroke-linecap',  'round');
+  blob.setAttribute('stroke-linejoin', 'round');
+  svg.appendChild(blob);
+  card.appendChild(svg);
+
+  // Per-point smoothed audio value — EMA to prevent jitter between frames
+  const smooth = new Float32Array(N);
+
+  function frame(ts) {
+    const t = ts * 0.001;
+
+    // Pull latest frequency data
+    let hasAudio = false;
+    if (_djAnalyser && _djFreqData) {
+      _djAnalyser.getByteFrequencyData(_djFreqData);
+      let sum = 0;
+      for (let i = 0; i < BINS_USED; i++) sum += _djFreqData[i];
+      hasAudio = sum > 80; // ignore near-silence
+    }
+
+    const pts = new Array(N);
+    for (let i = 0; i < N; i++) {
+      const theta = (2 * Math.PI * i) / N;
+      let r = R;
+
+      // Slow harmonic deformation (always active)
+      for (const h of H) r += h.a * Math.sin(h.k * theta + h.phase + h.speed * t);
+
+      // Audio-reactive layer: map each point to a linearly interpolated freq bin
+      if (hasAudio) {
+        const binF   = (i / N) * BINS_USED;
+        const b0     = Math.floor(binF);
+        const b1     = Math.min(b0 + 1, BINS_USED - 1);
+        const raw    = (_djFreqData[b0] * (1 - (binF - b0)) + _djFreqData[b1] * (binF - b0)) / 255;
+        smooth[i]    = smooth[i] * 0.55 + raw * 0.45; // per-point EMA
+        r           += smooth[i] * AMP_AUDIO;
+      } else {
+        smooth[i] *= 0.85; // decay toward zero on silence
+        r         += smooth[i] * AMP_AUDIO;
+      }
+
+      pts[i] = [CX + r * Math.cos(theta), CY + r * Math.sin(theta)];
+    }
+
+    // Smooth closed path: Q bezier through midpoints, original points as controls
+    const sx = (pts[N-1][0] + pts[0][0]) * 0.5;
+    const sy = (pts[N-1][1] + pts[0][1]) * 0.5;
+    let d = `M${sx.toFixed(2)} ${sy.toFixed(2)}`;
+    for (let i = 0; i < N; i++) {
+      const p  = pts[i];
+      const nx = (pts[i][0] + pts[(i + 1) % N][0]) * 0.5;
+      const ny = (pts[i][1] + pts[(i + 1) % N][1]) * 0.5;
+      d += ` Q${p[0].toFixed(2)} ${p[1].toFixed(2)} ${nx.toFixed(2)} ${ny.toFixed(2)}`;
+    }
+    blob.setAttribute('d', d + 'Z');
+    _djSplashAnimId = requestAnimationFrame(frame);
+  }
+
+  _djSplashAnimId = requestAnimationFrame(frame);
+}
+
+function hideDJSplash() {
+  if (_djSplashAnimId) { cancelAnimationFrame(_djSplashAnimId); _djSplashAnimId = null; }
+  if (_djAudioCtx)    { _djAudioCtx.close().catch(() => {}); _djAudioCtx = null; _djAnalyser = null; _djFreqData = null; }
+  const el = document.getElementById('ytap-dj-splash');
+  if (!el) return;
+  el.style.opacity = '0';
+  setTimeout(() => el.remove(), 420);
+}
+
+let _narrAnimId   = null;
+let _narrAudioCtx = null;
+let _narrAnalyser = null;
+let _narrFreqData = null;
+
+function connectNarrationToNarrAnalyser(audioEl) {
+  if (!_narrAnalyser || !_narrAudioCtx) return;
+  try {
+    if (_narrAudioCtx.state === 'suspended') _narrAudioCtx.resume();
+    const src = _narrAudioCtx.createMediaElementSource(audioEl);
+    src.connect(_narrAnalyser);
+  } catch (e) {
+    console.log('[yt-autopilot] narr analyser connect failed:', e.message);
+  }
+}
+
+function startNarrBlobRing(container) {
+  const SIZE = 110, CX = 55, CY = 55, R = 38, N = 120;
+  const AMP_BASE  = R * 0.08;
+  const AMP_AUDIO = R * 0.22;
+  const BINS_USED = 64;
+
+  const H = [
+    { k: 2, w: 0.40, phase: 0.50, speed:  0.90 },
+    { k: 3, w: 0.30, phase: 1.70, speed: -0.60 },
+    { k: 4, w: 0.20, phase: 3.00, speed:  0.40 },
+    { k: 5, w: 0.10, phase: 4.50, speed: -0.70 },
+  ];
+  const totalW = H.reduce((s, h) => s + h.w, 0);
+  H.forEach(h => { h.a = (h.w / totalW) * AMP_BASE; });
+
+  const NS  = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('width',    SIZE);
+  svg.setAttribute('height',   SIZE);
+  svg.setAttribute('viewBox',  `0 0 ${SIZE} ${SIZE}`);
+  svg.setAttribute('overflow', 'visible');
+
+  const blob = document.createElementNS(NS, 'path');
+  blob.setAttribute('fill',            'none');
+  blob.setAttribute('stroke',          '#a8c7fa');
+  blob.setAttribute('stroke-width',    '4.0');
+  blob.setAttribute('stroke-linecap',  'round');
+  blob.setAttribute('stroke-linejoin', 'round');
+  svg.appendChild(blob);
+  container.appendChild(svg);
+
+  const smooth = new Float32Array(N);
+
+  function frame(ts) {
+    const t = ts * 0.001;
+
+    let hasAudio = false;
+    if (_narrAnalyser && _narrFreqData) {
+      _narrAnalyser.getByteFrequencyData(_narrFreqData);
+      let sum = 0;
+      for (let i = 0; i < BINS_USED; i++) sum += _narrFreqData[i];
+      hasAudio = sum > 80;
+    }
+
+    const pts = new Array(N);
+    for (let i = 0; i < N; i++) {
+      const theta = (2 * Math.PI * i) / N;
+      let r = R;
+      for (const h of H) r += h.a * Math.sin(h.k * theta + h.phase + h.speed * t);
+      if (hasAudio) {
+        const binF = (i / N) * BINS_USED;
+        const b0   = Math.floor(binF);
+        const b1   = Math.min(b0 + 1, BINS_USED - 1);
+        const raw  = (_narrFreqData[b0] * (1 - (binF - b0)) + _narrFreqData[b1] * (binF - b0)) / 255;
+        smooth[i]  = smooth[i] * 0.55 + raw * 0.45;
+        r         += smooth[i] * AMP_AUDIO;
+      } else {
+        smooth[i] *= 0.85;
+        r         += smooth[i] * AMP_AUDIO;
+      }
+      pts[i] = [CX + r * Math.cos(theta), CY + r * Math.sin(theta)];
+    }
+
+    const sx = (pts[N-1][0] + pts[0][0]) * 0.5;
+    const sy = (pts[N-1][1] + pts[0][1]) * 0.5;
+    let d = `M${sx.toFixed(2)} ${sy.toFixed(2)}`;
+    for (let i = 0; i < N; i++) {
+      const p  = pts[i];
+      const nx = (pts[i][0] + pts[(i + 1) % N][0]) * 0.5;
+      const ny = (pts[i][1] + pts[(i + 1) % N][1]) * 0.5;
+      d += ` Q${p[0].toFixed(2)} ${p[1].toFixed(2)} ${nx.toFixed(2)} ${ny.toFixed(2)}`;
+    }
+    blob.setAttribute('d', d + 'Z');
+    _narrAnimId = requestAnimationFrame(frame);
+  }
+
+  _narrAnimId = requestAnimationFrame(frame);
+}
+
+function stopNarrBlobRing() {
+  if (_narrAnimId) { cancelAnimationFrame(_narrAnimId); _narrAnimId = null; }
+}
+
+function setNarrating(active) {
+  if (active) {
+    // Setup audio analyser
+    try {
+      _narrAudioCtx = new AudioContext();
+      _narrAnalyser = _narrAudioCtx.createAnalyser();
+      _narrAnalyser.fftSize = 256;
+      _narrAnalyser.smoothingTimeConstant = 0.82;
+      _narrAnalyser.connect(_narrAudioCtx.destination);
+      _narrFreqData = new Uint8Array(_narrAnalyser.frequencyBinCount);
+    } catch (e) {
+      console.log('[yt-autopilot] narr AudioContext failed:', e.message);
+    }
+
+    // Prepend section inside the overlay so they share the same box
+    const overlayEl = document.getElementById('ytap-overlay');
+    if (!overlayEl) return;
+    const section = document.createElement('div');
+    section.id = 'ytap-narr-section';
+    overlayEl.prepend(section);
+    requestAnimationFrame(() => section.classList.add('active'));
+    startNarrBlobRing(section);
+  } else {
+    stopNarrBlobRing();
+    const section = document.getElementById('ytap-narr-section');
+    if (section) {
+      section.classList.remove('active');
+      setTimeout(() => section.remove(), 320);
+    }
+    if (_narrAudioCtx) { _narrAudioCtx.close().catch(() => {}); _narrAudioCtx = null; _narrAnalyser = null; _narrFreqData = null; }
+  }
 }
 
 // ─── Overlay (Phase 3b/3c/3d) ────────────────────────────────────────────────
@@ -520,12 +793,8 @@ async function injectOverlay(video) {
 
   const overlay = document.createElement('div');
   overlay.id = 'ytap-overlay';
-  if (!video.paused) overlay.classList.add('playing');
   overlay.innerHTML = `
     <div class="ytap-top">
-      <div class="ytap-visualizer">
-        <span></span><span></span><span></span><span></span><span></span>
-      </div>
       <div class="ytap-meta">
         <div class="ytap-channel">${escapeHtml(current.channel || '')}</div>
         <div class="ytap-title">${escapeHtml(current.title || '')}</div>
@@ -533,22 +802,13 @@ async function injectOverlay(video) {
     </div>
     <div class="ytap-controls">
       <button id="ytap-back" ${hasHistory ? '' : 'disabled'}>&#9664; Back</button>
-      <button id="ytap-pause">${video.paused ? '&#9654; Play' : '&#10074;&#10074; Pause'}</button>
       <button id="ytap-skip">Skip &#9654;&#9654;</button>
     </div>
   `;
 
   document.body.appendChild(overlay);
 
-  const pauseBtn = overlay.querySelector('#ytap-pause');
-  const backBtn  = overlay.querySelector('#ytap-back');
-
-  pauseBtn.addEventListener('click', () => {
-    video.paused ? video.play() : video.pause();
-  });
-
-  video.addEventListener('pause', () => { pauseBtn.innerHTML = '&#9654; Play';           overlay.classList.remove('playing'); });
-  video.addEventListener('play',  () => { pauseBtn.innerHTML = '&#10074;&#10074; Pause'; overlay.classList.add('playing'); });
+  const backBtn = overlay.querySelector('#ytap-back');
 
   backBtn.addEventListener('click', async () => {
     const prev = await popFromHistory();
@@ -584,7 +844,9 @@ async function injectOverlay(video) {
         const topic = newSeg?.topic || 'general';
         console.log('[yt-autopilot] skip crossed segment boundary → narration:', topic);
         video.pause();
+        setNarrating(true);
         await playNarration(topic);
+        setNarrating(false);
       }
       await setStored({ ytap_current: pick });
       window.location.href = `https://www.youtube.com/watch?v=${pick.videoId}`;
@@ -685,7 +947,9 @@ async function onVideoEnded() {
       const blockNav = (e) => e.stopImmediatePropagation();
       document.addEventListener('yt-navigate-start', blockNav, { capture: true });
 
+      setNarrating(true);
       await playNarration(topic);
+      setNarrating(false);
 
       history.pushState = origPushState;
       document.removeEventListener('yt-navigate-start', blockNav, { capture: true });
@@ -752,6 +1016,7 @@ async function initAutoplay() {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'PICK_NEXT') {
     console.log('[yt-autopilot] PICK_NEXT received');
+    showDJSplash();
     pickNext().then(async pick => {
       try { sendResponse({ pick }); } catch (_) {}
       if (pick) {
@@ -759,12 +1024,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await new Promise(r => setTimeout(r, 1000));
         const firstSeg = await getStored('ytap_current_segment');
         if (firstSeg?.topic) await playNarration(firstSeg.topic);
+        hideDJSplash();
         await setStored({ ytap_current: pick });
         console.log('[yt-autopilot] navigating to first pick:', pick.videoId);
         window.location.href = `https://www.youtube.com/watch?v=${pick.videoId}`;
+      } else {
+        hideDJSplash();
       }
     }).catch(err => {
       console.error('[yt-autopilot] PICK_NEXT error:', err);
+      hideDJSplash();
       try { sendResponse({ pick: null }); } catch (_) {}
     });
     return true; // keep channel open for async response
