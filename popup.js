@@ -14,10 +14,26 @@ function updateUI(isActive) {
 document.getElementById('resetBtn').addEventListener('click', () => {
   chrome.storage.local.remove(
     ['ytap_channel_scores', 'ytap_taste_vectors', 'ytap_taste_watch_counts',
-     'ytap_candidates', 'ytap_last_segment_topic'],
+     'ytap_last_segment_topic', 'ytap_taste_anchors', 'ytap_total_completions'],
     () => window.close()
   );
 });
+
+// ── Pool health check ─────────────────────────────────────────────────────────
+// v2 needs ≥ CLUSTER_K × SEGMENT_SIZE (≈30) embedded candidates for ≥2 eligible
+// clusters. Below that it silently falls back to legacy — surface it here instead.
+
+(function checkPool() {
+  const POOL_WARN_THRESHOLD = 30;
+  chrome.storage.local.get('ytap_candidates', ({ ytap_candidates }) => {
+    const embedded = (ytap_candidates || []).filter(c => c.embedding).length;
+    if (embedded < POOL_WARN_THRESHOLD) {
+      const el = document.getElementById('poolWarning');
+      el.textContent = `Pool thin (${embedded} ready). Scroll your subscriptions feed first.`;
+      el.style.display = 'block';
+    }
+  });
+})();
 
 // ── Start / Stop ──────────────────────────────────────────────────────────────
 
@@ -34,7 +50,7 @@ chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
 
       if (!isDJHere) {
         chrome.storage.local.remove(
-          ['recentPicks', 'ytap_current_segment', 'ytap_last_segment_topic'],
+          ['ytap_current_segment', 'ytap_last_segment_topic'],
           () => {
             chrome.storage.local.get('ytap_channel_scores', ({ ytap_channel_scores }) => {
               const scores  = ytap_channel_scores || {};

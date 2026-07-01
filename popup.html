@@ -94,6 +94,15 @@
     }
 
     #resetBtn:hover { opacity: 0.85; }
+
+    /* ── Pool warning ── */
+    #poolWarning {
+      display: none;
+      font-size: 11px;
+      color: #f5a623;
+      line-height: 1.45;
+      margin-bottom: 12px;
+    }
   </style>
 </head>
 <body>
@@ -103,6 +112,7 @@
     <div class="status-dot" id="statusDot"></div>
   </div>
 
+  <div id="poolWarning"></div>
   <button id="toggleBtn" class="start">Start DJ</button>
 
   <div class="footer">
