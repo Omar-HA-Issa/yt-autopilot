@@ -1,18 +1,19 @@
 # Autopilot for YouTube
 
 A Chrome extension that removes the "what do I watch" decision on YouTube.
-Click **Start DJ**, it picks a video from your subscriptions and plays it, and
-when it ends (or you hit Skip) it automatically queues up the next one — like
-a Spotify DJ, but for your YouTube subscriptions feed. No menu, no scrolling,
-no choosing. It learns what you actually watch versus skip and gets better
-the more you use it.
+Click **Start DJ** and it picks a video and plays it, and when it ends (or
+you hit Skip) it automatically queues up the next one — like a Spotify DJ,
+but for YouTube. Starts from your subscriptions and YouTube feed, then
+follows what you actually watch versus skip and gets better the more you
+use it. No menu, no scrolling, no choosing.
 
 ---
 
 ## Features
 
 - **One button.** Start DJ, and YouTube becomes a continuous, autoplaying
-  queue built from your own subscriptions — no manual picking required.
+  queue built from your subscriptions and YouTube feed — no manual picking
+  required.
 - **Learns your taste from behavior, not ratings.** There's no thumbs-up or
   thumbs-down. Watching a video to the end is a positive signal; skipping
   early is a negative one. That's it.
@@ -30,18 +31,20 @@ the more you use it.
 
 ## How it works (short version)
 
-1. **Gathering candidates.** The extension reads your subscriptions feed and
-   the video sidebar directly from the page (the same page your browser
-   already loads when you're logged into YouTube) and builds a pool of
-   watchable videos — filtering out Shorts, livestreams, very short or
-   low-view videos, and obvious news-ticker titles.
+1. **Gathering candidates.** The extension reads whichever YouTube feed page
+   you're on (usually your home feed) and the video sidebar while something's
+   playing (rescraped every 45 seconds) directly from the page — the same
+   page your browser already has loaded when you're logged into YouTube. If
+   that pool gets thin, it also fetches your subscriptions feed in the
+   background. All of it is filtered — no Shorts, livestreams, very short or
+   low-view videos, or obvious news-ticker titles.
 2. **Understanding what a video is "about."** Each candidate's title and
    channel name is turned into a numeric embedding (a small on-device ML
    model, running fully locally — nothing is sent to a server) so that
    similar videos end up numerically close to each other.
 3. **Grouping into clusters.** Those embeddings are grouped into clusters —
-   loose topic buckets discovered automatically from your own subscriptions,
-   not from a fixed list of genres.
+   loose topic buckets discovered automatically from whatever's currently in
+   your pool, not from a fixed list of genres.
 4. **Learning your taste.** Every time you finish a video, the extension
    nudges a small set of "taste anchors" toward that video's embedding, and
    raises a score for that channel. Skipping early does the opposite, in
@@ -83,11 +86,11 @@ from source.
 3. Let it run — videos advance automatically when one ends. Use the on-page
    overlay to **Skip**, **Pause**, or go **Back**.
 4. Click **Stop DJ** in the popup at any time to hand control back.
-5. If the popup shows a "pool thin" warning, scroll through your
-   subscriptions feed for a bit so the extension has more videos to learn
-   from and cluster.
-6. **Reset taste profile** (in the popup) clears learned channel scores and
-   taste anchors if you want the DJ to start learning from scratch — your
+5. If the popup shows a "pool thin" warning, open your subscriptions or home
+   feed for a bit so the extension has more videos to learn from and cluster.
+6. **Reset taste profile** (in the popup) clears everything the DJ has
+   learned — channel scores, taste anchors, clusters, watch/skip history, and
+   recent picks — if you want it to start over from scratch. Your
    subscriptions themselves are untouched, since those live on YouTube, not
    in the extension.
 
@@ -98,7 +101,7 @@ from source.
   narration audio are bundled with the extension and run/play entirely
   locally.
 - The only network requests are the ones your browser already makes to
-  YouTube to load your subscriptions feed and video pages.
+  YouTube to load feed pages (home, subscriptions, sidebar) and video pages.
 - Everything the extension learns (channel scores, taste anchors, watch
   history for de-duplication) is stored locally via `chrome.storage.local`
   and never transmitted anywhere.

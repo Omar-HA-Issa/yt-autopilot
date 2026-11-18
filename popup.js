@@ -13,7 +13,8 @@ function updateUI(isActive) {
 
 document.getElementById('resetBtn').addEventListener('click', () => {
   chrome.storage.local.remove(
-    ['ytap_channel_scores', 'ytap_taste_anchors', 'ytap_total_completions'],
+    ['ytap_channel_scores', 'ytap_taste_anchors', 'ytap_total_completions',
+     'ytap_clusters', 'ytap_watched', 'recentPicks'],
     () => window.close()
   );
 });
@@ -30,7 +31,7 @@ document.getElementById('resetBtn').addEventListener('click', () => {
     const embedded = (ytap_candidates || []).filter(c => c.embedding).length;
     if (embedded < POOL_WARN_THRESHOLD) {
       const el = document.getElementById('poolWarning');
-      el.textContent = `Pool thin (${embedded} ready). Scroll your subscriptions feed first.`;
+      el.textContent = `Still learning. Open your subscriptions or home feed for a moment, then start.`;
       el.style.display = 'block';
     }
   });

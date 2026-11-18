@@ -2,11 +2,11 @@
 
 ## What this is
 A Chrome extension that removes the "what do I watch" decision on YouTube.
-You click Start, it picks a video from your subscriptions, plays it, and
-when it ends (or you hit Skip) it automatically picks the next one — like
-Spotify DJ, but for your YouTube subscriptions feed. No menu, no scrolling,
-no choosing. It learns what you actually watch vs. skip and gets better
-over time.
+You click Start, it picks a video and plays it, and when it ends (or you
+hit Skip) it automatically picks the next one — like Spotify DJ, but for
+YouTube. Starts from your subscriptions and YouTube feed, then follows what
+you actually watch vs. skip and gets better over time. No menu, no
+scrolling, no choosing.
 
 ---
 
@@ -42,7 +42,7 @@ over time.
 ## Selection system (v2 — what actually runs)
 
 ### Candidate pool
-Scraped from two sources, merged into `ytap_candidates` (max 100 entries):
+Scraped from three sources, merged into `ytap_candidates` (max 100 entries):
 - **Feed scrape** (`scrapeAndEmbedIfFeed`): fires 1.5 s after page load on any
   non-watch YouTube page. Reads DOM video cards.
 - **Sidebar scrape**: fires every 45 s during playback from the watch-page sidebar.

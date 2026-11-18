@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "YouTube Autopilot",
   "version": "0.1.0",
-  "description": "Spotify DJ for your YouTube subscriptions feed.",
+  "description": "A DJ for YouTube: themed runs from your subscriptions and feed, a voice between segments, and it learns what you skip.",
   "permissions": ["storage", "activeTab", "offscreen"],
   "host_permissions": ["https://www.youtube.com/*"],
   "content_security_policy": {
