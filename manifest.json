@@ -32,7 +32,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.youtube.com/*"],
-      "js": ["topic_centroids.js", "topic_classifier.js", "narration_manifest.js", "content.js"],
+      "js": ["topic_centroids.js", "narration_manifest.js", "content.js"],
       "css": ["content.css"]
     }
   ],

@@ -173,7 +173,6 @@ async function embedTexts(texts, timeoutMs = 30000) {
 // ─── Taste profile (5b) ───────────────────────────────────────────────────────
 
 const EMBED_DIM   = 384;
-const TASTE_ALPHA = 0.15; // kept until stage-4 dead-code deletion
 
 // ─── Tunable constants ────────────────────────────────────────────────────────
 const CLUSTER_K               = 10;   // number of embedding clusters
@@ -191,7 +190,6 @@ const ALPHA_CENTROID          = 0.10; // EMA: cluster centroid nudge toward new 
 const ALPHA_ANCHOR_VEC        = 0.15; // EMA: taste-anchor vector nudge toward completions
 const ALPHA_ANCHOR_WEIGHT     = 0.20; // EMA: taste-anchor weight bump on a hit
 const ALPHA_CHANNEL           = 0.10; // EMA: channel score
-const USE_NEW_PICKER          = true; // set false to fall back to legacy pick loop
 const POOL_BOOTSTRAP_THRESHOLD = 30; // embedded candidates below this → bootstrap before cluster selection
 const FILL_TOP_N               = 5;  // top candidates eligible for weighted-random fill (coherence gate)
 const NARRATION_CONFIDENCE_THRESHOLD = 0.40; // min cosine to nearest topic centroid to use genre narration; below this → generic fallback
@@ -211,16 +209,6 @@ function cosineSim(a, b) {
 function normalizeVec(v) {
   const mag = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
   return mag > 0 ? v.map(x => x / mag) : v;
-}
-
-async function updateTasteVector(embedding, topic) {
-  if (!embedding || embedding.length !== EMBED_DIM || !topic) return;
-  const allVecs = (await getStored('ytap_taste_vectors')) || {};
-  const stored = allVecs[topic] || new Array(EMBED_DIM).fill(0);
-  const updated = stored.map((v, i) => v * (1 - TASTE_ALPHA) + embedding[i] * TASTE_ALPHA);
-  const mag = Math.sqrt(updated.reduce((s, x) => s + x * x, 0));
-  allVecs[topic] = mag > 0 ? updated.map(x => x / mag) : updated;
-  await setStored({ ytap_taste_vectors: allVecs });
 }
 
 // ─── Clustering (warm-started k-means, k=CLUSTER_K) ──────────────────────────
@@ -298,15 +286,6 @@ async function updateClusters(embeddedCandidates) {
   if (changed) await setStored({ ytap_clusters: { centroids, members } });
 }
 
-function blendedWeight(channelScore, embedding, tasteVectors, watchCounts, topic) {
-  const tasteVector = tasteVectors?.[topic] ?? null;
-  const watchCount = watchCounts?.[topic] ?? 0;
-  if (!tasteVector || !embedding) return channelScore;
-  const simNorm = (cosineSim(embedding, tasteVector) + 1) / 2; // [-1,1] → [0,1]
-  const tw = Math.min(0.6, (watchCount / 10) * 0.6); // ramps 0→0.6 over first 10 natural ends
-  return (1 - tw) * channelScore + tw * simNorm;
-}
-
 function embedCandidatesAsync(candidates) {
   if (!chrome.runtime?.id) return;
   // Fire and forget — offscreen document embeds and writes to storage directly.
@@ -316,201 +295,8 @@ function embedCandidatesAsync(candidates) {
   });
 }
 
-// ─── Segment logic (5c / Phase 6) ────────────────────────────────────────────
-
-const SIM_THRESHOLD = 0.30;
-
-const TOPIC_ADJACENCY = {
-  gaming:      ['tech', 'commentary', 'film_tv'],
-  tech:        ['science', 'gaming', 'finance'],
-  finance:     ['commentary', 'tech', 'history'],
-  science:     ['history', 'tech', 'film_tv'],
-  history:     ['science', 'commentary', 'film_tv'],
-  comedy:      ['commentary', 'film_tv', 'music'],
-  music:       ['comedy', 'film_tv', 'sports'],
-  sports:      ['commentary', 'music', 'food'],
-  food:        ['comedy', 'sports', 'film_tv'],
-  film_tv:     ['comedy', 'music', 'commentary'],
-  commentary:  ['comedy', 'film_tv', 'history'],
-  general:     ['comedy', 'film_tv', 'music'],
-};
-
-function segmentCentroid(segment) {
-  const embeds = segment.filter(c => c.embedding);
-  if (!embeds.length) return null;
-  const avg = new Array(EMBED_DIM).fill(0);
-  for (const c of embeds) {
-    for (let i = 0; i < EMBED_DIM; i++) avg[i] += c.embedding[i];
-  }
-  const mag = Math.sqrt(avg.reduce((s, x) => s + x * x, 0));
-  return mag > 0 ? avg.map(x => x / mag) : null;
-}
-
-function candidateTopic(c) {
-  if (c.embedding && typeof YTAP_CLASSIFY_VEC !== 'undefined') return YTAP_CLASSIFY_VEC(c.embedding);
-  if (typeof YTAP_CLASSIFY !== 'undefined') return YTAP_CLASSIFY([c.title]);
-  return 'general';
-}
-
-function formSegment(pool, scores, tasteVectors, watchCounts, lastTopic = null) {
-  // Prefer embedded candidates as anchor — filling only works when anchor has an embedding.
-  const poolWithEmbed = pool.filter(c => c.embedding);
-  let anchorPool = poolWithEmbed.length > 0 ? poolWithEmbed : pool;
-
-  // Discovery mode — 10% of the time after 5+ watched videos, pick from an
-  // adjacent unexplored topic to introduce novelty.
-  const totalWatched = Object.values(watchCounts || {}).reduce((a, b) => a + b, 0);
-  let discoveryFired = false;
-  if (totalWatched >= 5 && Math.random() < 0.10) {
-    const dominantTopic = Object.entries(watchCounts).sort((a, b) => b[1] - a[1])[0]?.[0];
-    const adjacent = TOPIC_ADJACENCY[dominantTopic] || [];
-    const unexplored = adjacent.filter(t => !watchCounts[t]);
-    const discoveryTopic = unexplored[Math.floor(Math.random() * unexplored.length)];
-    if (discoveryTopic) {
-      const discoveryPool = anchorPool.filter(c => candidateTopic(c) === discoveryTopic);
-      if (discoveryPool.length > 0) {
-        console.log('[yt-autopilot] discovery mode:', dominantTopic, '→', discoveryTopic);
-        anchorPool = discoveryPool;
-        discoveryFired = true;
-      }
-    }
-  }
-
-  // Avoid repeating the last segment's topic when alternatives exist (skip if discovery already picked).
-  if (!discoveryFired && lastTopic && lastTopic !== 'general' && anchorPool.length > 1) {
-    const altPool = anchorPool.filter(c => candidateTopic(c) !== lastTopic);
-    if (altPool.length > 0) {
-      console.log('[yt-autopilot] topic diversity: excluding', lastTopic, '→', altPool.length, 'candidates');
-      anchorPool = altPool;
-    }
-  }
-
-  const anchor = weightedPick(anchorPool, scores, tasteVectors, watchCounts);
-  const segment = [anchor];
-  const rest = pool.filter(c => c.videoId !== anchor.videoId);
-
-  const withEmbed = rest.filter(c => c.embedding);
-  if (anchor.embedding && withEmbed.length > 0) {
-    const ranked = withEmbed
-      .map(c => ({ ...c, _sim: cosineSim(c.embedding, anchor.embedding) }))
-      .filter(c => c._sim >= SIM_THRESHOLD)
-      .sort((a, b) => b._sim - a._sim);
-
-    while (segment.length < SEGMENT_SIZE && ranked.length) {
-      const next = ranked.shift();
-      delete next._sim;
-      segment.push(next);
-    }
-  }
-
-  // Classify using segment centroid vector (Phase 6); fall back to keyword matching.
-  const centroid = segmentCentroid(segment);
-  const topic = (centroid && typeof YTAP_CLASSIFY_VEC !== 'undefined' && YTAP_CLASSIFY_VEC(centroid))
-    ?? (typeof YTAP_CLASSIFY !== 'undefined' ? YTAP_CLASSIFY(segment.map(c => c.title)) : 'general');
-
-  console.log('[yt-autopilot] formSegment topic:', topic, segment.map(v => v.title));
-  return { topic, videos: segment };
-}
-
 function willStartNewSegment(seg) {
   return !seg || seg.segmentIndex >= seg.videos.length;
-}
-
-// ─── Pick logic ───────────────────────────────────────────────────────────────
-
-async function pickNextLegacy() {
-  // Drain the current segment before forming a new one.
-  const seg = await getStored('ytap_current_segment');
-  if (seg && seg.segmentIndex < seg.videos.length) {
-    const pick = seg.videos[seg.segmentIndex];
-    await setStored({ ytap_current_segment: { ...seg, segmentIndex: seg.segmentIndex + 1 } });
-    console.log('[yt-autopilot] segment drain [', seg.segmentIndex + 1, '/', seg.videos.length, ']', seg.topic, pick.title);
-    await addToRecentPicks(pick.videoId);
-    return pick;
-  }
-
-  // Segment exhausted or none — build a new one.
-  let candidates = getCandidates();
-
-  if (!candidates.length && location.pathname !== '/watch') {
-    for (let i = 0; i < 5 && !candidates.length; i++) {
-      await new Promise(r => setTimeout(r, 800));
-      candidates = getCandidates();
-    }
-  }
-
-  console.log('[yt-autopilot] getCandidates() returned', candidates.length, 'on', location.pathname);
-
-  if (candidates.length) {
-    // Merge with stored pool — keep embeddings, drop stale no-views entries, cap at 100
-    const prev = (await getStored('ytap_candidates')) || [];
-    const prevById = Object.fromEntries(prev.map(c => [c.videoId, c]));
-    const freshWithEmbed = candidates.map(c => ({ ...c, embedding: prevById[c.videoId]?.embedding }));
-    const newIds = new Set(candidates.map(c => c.videoId));
-    const retained = prev.filter(c => !newIds.has(c.videoId) && !(c.views > 0 && c.views < MIN_VIEWS_HARD));
-    const merged = [...freshWithEmbed, ...retained].slice(0, 100);
-    await setStored({ ytap_candidates: merged });
-    await updateClusters(merged.filter(c => c.embedding));
-    embedCandidatesAsync(freshWithEmbed.filter(c => !c.embedding));
-    candidates = merged;
-  } else {
-    const raw = (await getStored('ytap_candidates')) || [];
-    candidates = raw.filter(c => !(c.views > 0 && c.views < MIN_VIEWS_HARD));
-    console.log('[yt-autopilot] using stored candidates:', candidates.length, '(filtered from', raw.length, ')');
-
-    // Trigger embedding for any stored candidates that are missing it.
-    const needsEmbed = candidates.filter(c => !c.embedding);
-    if (needsEmbed.length > 0) {
-      embedCandidatesAsync(needsEmbed);
-      // Cold start: if NOTHING is embedded yet, wait for the model to process
-      // before forming a segment — otherwise every segment is size 1.
-      if (needsEmbed.length === candidates.length) {
-        console.log('[yt-autopilot] cold start — waiting for embeddings…');
-        await new Promise(r => setTimeout(r, 4000));
-        const updated = (await getStored('ytap_candidates')) || [];
-        const byId = Object.fromEntries(updated.map(c => [c.videoId, c]));
-        candidates = candidates.map(c => ({ ...c, embedding: byId[c.videoId]?.embedding ?? null }));
-        console.log('[yt-autopilot] embeddings after wait:', candidates.filter(c => c.embedding).length, '/', candidates.length);
-        await updateClusters(candidates.filter(c => c.embedding));
-      }
-    }
-  }
-
-  if (!candidates.length) {
-    console.log('[yt-autopilot] no candidates available');
-    return null;
-  }
-
-  // Same hard-exclusion + oldest-first starvation relaxation the v2 picker uses.
-  // Legacy used to reset recentPicks to the last 5 whenever the pool looked "seen",
-  // which quietly defeated de-dup, and never checked ytap_watched at all — a fully
-  // watched video could be re-served any time the picker fell back to this path.
-  const [recentPicks, rawWatched] = await Promise.all([
-    getRecentPicks(),
-    getStored('ytap_watched'),
-  ]);
-  const now_ms     = Date.now();
-  const watchedMap = Object.fromEntries(
-    Object.entries(rawWatched || {}).filter(([, ts]) => now_ms - ts < WATCHED_TTL_MS)
-  );
-  const finalPool = resolveExclusionPool(candidates, recentPicks, watchedMap);
-
-  const scores = (await getStored('ytap_channel_scores')) || {};
-  const tasteVectors = (await getStored('ytap_taste_vectors')) || {};
-  const watchCounts = (await getStored('ytap_taste_watch_counts')) || {};
-  const lastTopic = (await getStored('ytap_last_segment_topic')) || null;
-  const newSeg = formSegment(finalPool, scores, tasteVectors, watchCounts, lastTopic);
-
-  // Save segment with index at 1 — returning index 0 now.
-  await setStored({
-    ytap_current_segment: { ...newSeg, segmentIndex: 1 },
-    ytap_last_segment_topic: newSeg.topic,
-  });
-
-  const pick = newSeg.videos[0];
-  await addToRecentPicks(pick.videoId);
-  console.log('[yt-autopilot] new segment:', newSeg.topic, '— first pick:', pick.title);
-  return pick;
 }
 
 // ─── Taste anchors (v2) ───────────────────────────────────────────────────────
@@ -730,8 +516,8 @@ function resolveExclusionPool(available, recentPicks, watchedMap) {
 
 // ─── New pick loop (v2) ───────────────────────────────────────────────────────
 
-async function pickNextNew() {
-  // 1. Drain current segment first — same behavior as legacy
+async function pickNextNew(coldStartRetried = false) {
+  // 1. Drain current segment first
   const seg = await getStored('ytap_current_segment');
   if (seg && seg.segmentIndex < seg.videos.length) {
     const pick = seg.videos[seg.segmentIndex];
@@ -763,8 +549,13 @@ async function pickNextNew() {
 
   const { centroids, members } = clusterData || {};
   if (!centroids || centroids.length < CLUSTER_K) {
-    console.log('[yt-autopilot] v2: clusters not ready — falling back to legacy');
-    return pickNextLegacy();
+    if (!coldStartRetried) {
+      console.log('[yt-autopilot] v2: clusters not ready — attempting direct embed + cluster');
+      await coldStartEmbedAndCluster();
+      return pickNextNew(true);
+    }
+    console.log('[yt-autopilot] v2: clusters still not ready after cold-start embed — using lightweight fallback');
+    return pickNextColdStart();
   }
 
   const allCandidates = storedCandidates || [];
@@ -804,8 +595,13 @@ async function pickNextNew() {
   }
 
   if (!clusterInfos.length) {
-    console.log('[yt-autopilot] v2: no eligible clusters — falling back to legacy');
-    return pickNextLegacy();
+    if (!coldStartRetried) {
+      console.log('[yt-autopilot] v2: no eligible clusters — attempting direct embed + cluster');
+      await coldStartEmbedAndCluster();
+      return pickNextNew(true);
+    }
+    console.log('[yt-autopilot] v2: still no eligible clusters after cold-start embed — using lightweight fallback');
+    return pickNextColdStart();
   }
 
   // Hard-quarantine clusters below COHERENCE_FLOOR from the main softmax.
@@ -940,8 +736,86 @@ async function pickNextNew() {
   return anchor;
 }
 
+// ─── Cold-start fallback ───────────────────────────────────────────────────────
+// Fires only when pickNextNew() can't find a usable cluster yet (e.g. a brand-new
+// install's very first pick, before CLUSTER_K candidates have been embedded and
+// clustered). Embeds whatever's missing directly — awaited, bounded by
+// COLD_START_EMBED_TIMEOUT_MS — instead of the fire-and-forget EMBED_AND_STORE
+// path, then clusters once so pickNextNew() can retry with a real pool. The DJ
+// splash/cold-open narration is already showing during this window, so a few
+// seconds of extra wait on the very first pick is acceptable.
+
+const COLD_START_EMBED_TIMEOUT_MS = 15000;
+
+async function coldStartEmbedAndCluster() {
+  const candidates = (await getStored('ytap_candidates')) || [];
+  const unembedded = candidates.filter(c => !c.embedding);
+  if (!unembedded.length) return;
+
+  const texts = unembedded.map(c => `${c.channel}: ${c.title}`);
+  const embeddings = await embedTexts(texts, COLD_START_EMBED_TIMEOUT_MS);
+  if (!embeddings) {
+    console.log('[yt-autopilot] cold start: direct embed timed out/failed');
+    return;
+  }
+
+  const byId = Object.fromEntries(candidates.map(c => [c.videoId, c]));
+  let embedded = 0;
+  unembedded.forEach((c, i) => {
+    if (embeddings[i]) { byId[c.videoId] = { ...c, embedding: embeddings[i] }; embedded++; }
+  });
+  const merged = Object.values(byId);
+  await setStored({ ytap_candidates: merged });
+  await updateClusters(merged.filter(c => c.embedding));
+  console.log('[yt-autopilot] cold start: directly embedded', embedded, '/', unembedded.length, 'candidates');
+}
+
+// Last resort when clusters are still unusable after the cold-start embed retry —
+// weighted-random by channel score + view count only, no clustering or topics.
+// Should only ever fire on a fresh install's first pick.
+async function pickNextColdStart() {
+  const [allCandidates, channelScores, recentPicks, rawWatched] = await Promise.all([
+    getStored('ytap_candidates'),
+    getStored('ytap_channel_scores'),
+    getRecentPicks(),
+    getStored('ytap_watched'),
+  ]);
+  const now_ms     = Date.now();
+  const watchedMap = Object.fromEntries(
+    Object.entries(rawWatched || {}).filter(([, ts]) => now_ms - ts < WATCHED_TTL_MS)
+  );
+  const scores = channelScores || {};
+  const pool   = resolveExclusionPool(allCandidates || [], recentPicks, watchedMap);
+
+  const logViews = pool.map(c => Math.log10((c.views || 0) + 1));
+  const maxLog   = Math.max(...logViews);
+  const minLog   = Math.min(...logViews);
+  const logRange = maxLog - minLog || 1;
+
+  const weights = pool.map((c, i) => {
+    const channelScore = scores[c.channel] ?? 0.5;
+    const viewPrior    = (logViews[i] - minLog) / logRange;
+    return 0.85 * channelScore + 0.15 * viewPrior;
+  });
+
+  const total = weights.reduce((a, b) => a + b, 0);
+  let picked = pool[pool.length - 1];
+  if (total > 0) {
+    let r = Math.random() * total;
+    for (let i = 0; i < pool.length; i++) {
+      r -= weights[i];
+      if (r <= 0) { picked = pool[i]; break; }
+    }
+  }
+
+  console.log('[yt-autopilot] cold-start fallback pick:', picked?.title);
+  await setStored({ ytap_current_segment: { videos: [picked], segmentIndex: 1 } });
+  await addToRecentPicks(picked.videoId);
+  return picked;
+}
+
 async function pickNext() {
-  return USE_NEW_PICKER ? pickNextNew() : pickNextLegacy();
+  return pickNextNew();
 }
 
 // ─── History helpers (Phase 3d) ───────────────────────────────────────────────
@@ -975,14 +849,6 @@ async function updateChannelScore(channel, signal) {
 
   if (signal === 1.0) {
     const current = (await getStored('ytap_current')) || {};
-    const topic = candidateTopic(current);
-    const counts = (await getStored('ytap_taste_watch_counts')) || {};
-    counts[topic] = (counts[topic] || 0) + 1;
-    await setStored({ ytap_taste_watch_counts: counts });
-    if (current.embedding) {
-      await updateTasteVector(current.embedding, topic);
-      console.log('[yt-autopilot] taste vector updated from:', current.title, 'topic:', topic, '(count:', counts[topic], ')');
-    }
     // v2: update taste anchors and session completion count
     if (current.embedding) await updateTasteAnchors(current.embedding);
     // Long-term completion suppression: mark video watched so it stays out of
@@ -995,29 +861,6 @@ async function updateChannelScore(channel, signal) {
     const completions = (await getStored('ytap_total_completions')) || 0;
     await setStored({ ytap_total_completions: completions + 1 });
   }
-}
-
-function weightedPick(pool, scores, tasteVectors, watchCounts) {
-  // Log-normalize view counts across the pool so a 10M video isn't 10000x a 1K video
-  const logViews = pool.map(c => Math.log10((c.views || 0) + 1));
-  const maxLog = Math.max(...logViews);
-  const minLog = Math.min(...logViews);
-  const logRange = maxLog - minLog || 1;
-
-  const weights = pool.map((c, i) => {
-    const topic = candidateTopic(c);
-    const base = blendedWeight(scores[c.channel] ?? 0.5, c.embedding ?? null, tasteVectors, watchCounts, topic);
-    const viewScore = (logViews[i] - minLog) / logRange;
-    return 0.85 * base + 0.15 * viewScore;
-  });
-
-  const total = weights.reduce((a, b) => a + b, 0);
-  let r = Math.random() * total;
-  for (let i = 0; i < pool.length; i++) {
-    r -= weights[i];
-    if (r <= 0) return pool[i];
-  }
-  return pool[pool.length - 1];
 }
 
 // ─── Narration classification (Stage 3) ──────────────────────────────────────
@@ -1036,24 +879,6 @@ function classifyForNarration(centroid) {
   return { label: bestLabel, score: bestScore };
 }
 
-// Resolves the narration topic from a stored segment, applying the confidence gate.
-// Handles both v2 segments (narrationLabel + narrationScore) and legacy segments (topic).
-// Low-confidence fallback uses 'general' (audio/general/). TODO: if gen01-03.mp3 are
-// genre-labeled rather than neutral transition lines, replace with a dedicated
-// audio/transition/ folder and update YTAP_NARRATION accordingly.
-function resolveNarrationTopic(seg) {
-  if (!seg) return 'general';
-  if (seg.narrationLabel !== undefined) {
-    if (seg.narrationScore >= NARRATION_CONFIDENCE_THRESHOLD) {
-      console.log(`[yt-autopilot] narration: ${seg.narrationLabel} (cosine ${seg.narrationScore.toFixed(2)}, confident)`);
-      return seg.narrationLabel;
-    }
-    console.log(`[yt-autopilot] narration: general (cosine ${seg.narrationScore.toFixed(2)}, below threshold ${NARRATION_CONFIDENCE_THRESHOLD})`);
-    return 'general';
-  }
-  return seg.topic || 'general'; // legacy path
-}
-
 // Maps classifier label → mid-session genre bucket.
 // music and sports deliberately absent — their clusters are too broad; they fall through
 // to continuation_generic. commentary and general likewise have no dedicated cont_ bucket.
@@ -1068,10 +893,10 @@ const CONT_BUCKET_MAP = {
   film_tv: 'cont_filmtv',
 };
 
-// Resolves which bucket to play at a mid-session segment boundary.
-// v2 path: uses narrationLabel + narrationScore + confidence gate.
-// Legacy path: no narrationLabel → always continuation_generic.
-// Falls through to continuation_generic if the bucket has no files yet (during dev).
+// Resolves which bucket to play at a mid-session segment boundary, using
+// narrationLabel + narrationScore + confidence gate. The cold-start fallback
+// segment (pickNextColdStart) has no narrationLabel, so it always lands on
+// continuation_generic — same as a bucket with no files yet (during dev).
 function resolveContinuationBucket(seg) {
   if (!seg || seg.narrationLabel === undefined) return 'continuation_generic';
   if (seg.narrationScore >= NARRATION_CONFIDENCE_THRESHOLD) {

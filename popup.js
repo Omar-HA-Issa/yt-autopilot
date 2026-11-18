@@ -13,15 +13,16 @@ function updateUI(isActive) {
 
 document.getElementById('resetBtn').addEventListener('click', () => {
   chrome.storage.local.remove(
-    ['ytap_channel_scores', 'ytap_taste_vectors', 'ytap_taste_watch_counts',
-     'ytap_last_segment_topic', 'ytap_taste_anchors', 'ytap_total_completions'],
+    ['ytap_channel_scores', 'ytap_taste_anchors', 'ytap_total_completions'],
     () => window.close()
   );
 });
 
 // ── Pool health check ─────────────────────────────────────────────────────────
 // v2 needs ≥ CLUSTER_K × SEGMENT_SIZE (≈30) embedded candidates for ≥2 eligible
-// clusters. Below that it silently falls back to legacy — surface it here instead.
+// clusters. Below that, pickNextNew() burns a few extra seconds on a direct
+// embed-and-retry before falling back to a lightweight channel/view-based pick
+// — surface the thin pool here instead of letting that happen silently.
 
 (function checkPool() {
   const POOL_WARN_THRESHOLD = 30;
@@ -50,7 +51,7 @@ chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
 
       if (!isDJHere) {
         chrome.storage.local.remove(
-          ['ytap_current_segment', 'ytap_last_segment_topic'],
+          ['ytap_current_segment'],
           () => {
             chrome.storage.local.get('ytap_channel_scores', ({ ytap_channel_scores }) => {
               const scores  = ytap_channel_scores || {};
