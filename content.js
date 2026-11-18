@@ -481,20 +481,19 @@ async function pickNextLegacy() {
     return null;
   }
 
-  let recentPicks = await getRecentPicks();
-  let seen = new Set(recentPicks.map(x => x.id));
-  let pool = candidates.filter(c => !seen.has(c.videoId));
-
-  if (pool.length === 0) {
-    // All candidates seen — keep only last 5 to avoid immediate repeats
-    recentPicks = recentPicks.slice(0, 5);
-    await setStored({ recentPicks });
-    seen = new Set(recentPicks.map(x => x.id));
-    pool = candidates.filter(c => !seen.has(c.videoId));
-    console.log('[yt-autopilot] recentPicks reset — pool refreshed to', pool.length);
-  }
-
-  const finalPool = pool.length > 0 ? pool : candidates;
+  // Same hard-exclusion + oldest-first starvation relaxation the v2 picker uses.
+  // Legacy used to reset recentPicks to the last 5 whenever the pool looked "seen",
+  // which quietly defeated de-dup, and never checked ytap_watched at all — a fully
+  // watched video could be re-served any time the picker fell back to this path.
+  const [recentPicks, rawWatched] = await Promise.all([
+    getRecentPicks(),
+    getStored('ytap_watched'),
+  ]);
+  const now_ms     = Date.now();
+  const watchedMap = Object.fromEntries(
+    Object.entries(rawWatched || {}).filter(([, ts]) => now_ms - ts < WATCHED_TTL_MS)
+  );
+  const finalPool = resolveExclusionPool(candidates, recentPicks, watchedMap);
 
   const scores = (await getStored('ytap_channel_scores')) || {};
   const tasteVectors = (await getStored('ytap_taste_vectors')) || {};
@@ -690,12 +689,13 @@ async function bootstrapPool() {
   }
 }
 
-// ─── Cluster pool resolver ────────────────────────────────────────────────────
-// Hard-excludes recently-picked and long-watched videos from a cluster's available
-// pool. If exclusion would leave fewer than SEGMENT_SIZE candidates, relaxes the
+// ─── Exclusion pool resolver ───────────────────────────────────────────────────
+// Hard-excludes recently-picked and long-watched videos from a candidate pool.
+// If exclusion would leave fewer than SEGMENT_SIZE candidates, relaxes the
 // exclusion oldest-first (across both sets combined) until the pool is refillable.
 // Never returns an empty pool — worst case it returns all available videos.
-function resolveClusterPool(available, recentPicks, watchedMap) {
+// Shared by the v2 cluster picker and the legacy fallback picker.
+function resolveExclusionPool(available, recentPicks, watchedMap) {
   const recentById = Object.fromEntries(recentPicks.map(x => [x.id, x.ts]));
 
   const fresh    = [];
@@ -722,7 +722,7 @@ function resolveClusterPool(available, recentPicks, watchedMap) {
     pool.push(c);
   }
   if (pool.length < available.length) {
-    console.log('[yt-autopilot] v2 starvation fallback: cluster relaxed',
+    console.log('[yt-autopilot] starvation fallback: pool relaxed',
       pool.length - fresh.length, 'exclusions (oldest-first),', fresh.length, 'fresh');
   }
   return pool.length > 0 ? pool : available; // absolute last resort: all members
@@ -865,7 +865,7 @@ async function pickNextNew() {
   }
 
   // 6. Within-cluster pick: hard-exclude recent/watched; resolve pool with starvation fallback
-  const pool     = resolveClusterPool(chosenCluster.available, recentPicks, watchedMap);
+  const pool     = resolveExclusionPool(chosenCluster.available, recentPicks, watchedMap);
   const logViews = pool.map(c => Math.log10((c.views || 0) + 1));
   const maxLog   = Math.max(...logViews);
   const minLog   = Math.min(...logViews);
@@ -1082,11 +1082,39 @@ function resolveContinuationBucket(seg) {
 }
 
 // ─── Narration (Phase 5e) ─────────────────────────────────────────────────────
+// _narrationRecency and _lastNarrationTs are mirrored to chrome.storage.local
+// (ytap_narration_recency / ytap_narration_last_ts). Every segment boundary
+// navigates via window.location.href — a hard navigation that fully re-injects
+// the content script and resets plain module state — so without persisting
+// these, anti-repetition and the cooldown are inert on every segment, not just
+// across a manual extension reload.
 
 const _narrationRecency    = new Map(); // bucket → Set of recently played filenames (FIFO, size ≤ ceil(bucketSize/2))
 let _lastNarrationTs       = 0;         // timestamp of the most recently started narration clip
 let _currentNarrationAudio = null;
 let _narrationResolve  = null;
+let _narrationStateReady   = null;
+
+function loadNarrationState() {
+  if (!_narrationStateReady) {
+    _narrationStateReady = Promise.all([
+      getStored('ytap_narration_recency'),
+      getStored('ytap_narration_last_ts'),
+    ]).then(([storedRecency, storedTs]) => {
+      for (const [bucket, filenames] of Object.entries(storedRecency || {})) {
+        _narrationRecency.set(bucket, new Set(filenames));
+      }
+      _lastNarrationTs = storedTs || 0;
+    });
+  }
+  return _narrationStateReady;
+}
+
+function saveNarrationState() {
+  const recencyObj = {};
+  for (const [bucket, set] of _narrationRecency.entries()) recencyObj[bucket] = [...set];
+  return setStored({ ytap_narration_recency: recencyObj, ytap_narration_last_ts: _lastNarrationTs });
+}
 
 function stopNarration() {
   if (_currentNarrationAudio) {
@@ -1103,6 +1131,8 @@ async function playNarration(bucket) {
   if (typeof YTAP_NARRATION === 'undefined') return;
   const clips = YTAP_NARRATION[bucket];
   if (!clips?.length) return;
+
+  await loadNarrationState();
 
   const now = Date.now();
   if (now - _lastNarrationTs < NARRATION_COOLDOWN_MS) {
@@ -1121,6 +1151,7 @@ async function playNarration(bucket) {
   recency.add(clip);
   if (recency.size > exclude) recency.delete(recency.values().next().value); // evict oldest
   _narrationRecency.set(bucket, recency);
+  await saveNarrationState();
 
   const audio = new Audio(chrome.runtime.getURL(`audio/${bucket}/${clip}`));
   _currentNarrationAudio = audio;
@@ -1528,6 +1559,22 @@ function waitForVideo(timeoutMs = 8000) {
   });
 }
 
+// waitForVideo() alone gave up permanently on a single 8s miss, stranding the
+// session with no overlay and no 'ended' listener since nothing else re-triggers
+// initAutoplay() on the same URL. Retry a few times first; if still nothing,
+// fall back to whatever <video> exists even if it never hit readyState >= 1 —
+// enough to hand the user a Skip button instead of a dead tab.
+async function waitForVideoWithRetries(maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const video = await waitForVideo();
+    if (video) return video;
+    console.log(`[yt-autopilot] waitForVideo attempt ${attempt}/${maxAttempts} failed, retrying`);
+  }
+  const fallback = document.querySelector('video');
+  if (fallback) console.log('[yt-autopilot] waitForVideo: using unready video element as last resort');
+  return fallback;
+}
+
 let autoplayActive = false;
 let autoplayInitUrl = '';
 let _scrapeInterval = null;
@@ -1617,8 +1664,9 @@ async function initAutoplay() {
   autoplayActive = true;
   autoplayInitUrl = url;
 
-  const video = await waitForVideo();
+  const video = await waitForVideoWithRetries();
   if (!video) {
+    console.log('[yt-autopilot] initAutoplay: no video element found after retries — giving up on', url);
     autoplayActive = false;
     autoplayInitUrl = '';
     return;
@@ -1709,6 +1757,7 @@ function warmNarrationColdOpen() {
 }
 
 warmNarrationColdOpen();
+loadNarrationState(); // pre-hydrate recency/cooldown from storage so the first playNarration() call doesn't wait on it
 scrapeAndEmbedIfFeed();
 initAutoplay();
 

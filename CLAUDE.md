@@ -10,34 +10,54 @@ over time.
 
 ---
 
-## Overhaul status (read this first)
+## Where things stand
 
-The selection engine has been fully replaced. Stage 2 is **complete and verified**
-on a clean run: no repeats across segments, affinity correctly learns taste (history
-cluster affinity climbed 0.038 → 0.169 across completions), coherent same-cluster
-blocks (history block hit coherence 0.583), proper cluster branching, COHERENCE_FLOOR
-quarantine firing, and de-dup suppression working.
+- **Selection engine (v2): complete and live**, behind `USE_NEW_PICKER = true`
+  (`pickNextNew()` in `content.js`). Verified on a clean run — de-dup, affinity
+  learning, cluster coherence, and discovery branching all behaving as designed.
+  `pickNextLegacy()` / `formSegment()` still exist as a fallback for when clusters
+  aren't cold-started yet. **Do not build new selection logic on the legacy path**
+  — Stage 4 dead-code deletion is still pending — but note it just received real
+  bug fixes (below), so it's not purely vestigial right now.
 
-**What runs today:** `pickNextNew()` behind `USE_NEW_PICKER = true`. The legacy
-`pickNextLegacy()` / `formSegment()` path is still present but only reachable as a
-fallback when clusters aren't ready. **Do not build on the legacy path.** It will be
-deleted in Stage 4.
+- **Narration (Stage 3): complete.** Fully rewritten by session position/confidence
+  instead of per-topic (see [Narration system](#narration-system-stage-3) below),
+  126 lines generated via ElevenLabs, `narration_manifest.js` filled in, runtime
+  wiring live. Old flat 12-topic narration is fully retired from the live code path.
 
-### Remaining work
-- **Stage 3** — Narration rewiring: at segment boundary, take the chosen cluster's
-  centroid, cosine-classify it against the 12 narration centroids in
-  `topic_centroids.js`, use the closest label to select the MP3 folder. The
-  classification must NOT appear anywhere in the selection path — narration label
-  is audio-only.
-- **Stage 4** — Dead-code deletion: remove `formSegment`, `weightedPick`,
-  `blendedWeight`, `candidateTopic`, `updateTasteVector`, `TOPIC_ADJACENCY`,
-  `SIM_THRESHOLD`, `TASTE_ALPHA`, all `YTAP_CLASSIFY_VEC` call sites in selection,
-  and the deprecated storage keys (`ytap_taste_vectors`, `ytap_taste_watch_counts`,
-  `ytap_last_segment_topic`).
+- **Open item — continuing next session:** narration audio pacing. ElevenLabs
+  `speed` in `scripts/generate_narration.js` went default `1.0` → `0.85` (test) →
+  settled at `0.9`. Whether the lines themselves should also be lengthened (they
+  run 9–17 words) was raised but deferred — pick up there.
+
+- **Bugs found + fixed this session** (`content.js`, uncommitted):
+  1. **Narration recency/cooldown were pure in-memory state.** Every segment
+     boundary navigates via a hard `window.location.href` navigation, which fully
+     re-injects the content script and wiped both `_narrationRecency` and
+     `_lastNarrationTs` — so anti-repeat and the 20s cooldown were inert on
+     *every* segment, not just on manual reloads. Fixed by persisting to
+     `chrome.storage.local` (`ytap_narration_recency`, `ytap_narration_last_ts`),
+     hydrated once via `loadNarrationState()`. Confirmed fixed via live testing.
+  2. **`pickNextLegacy()` never checked `ytap_watched`**, and reset `recentPicks`
+     to its last 5 entries whenever the pool looked fully "seen" — a fallback to
+     legacy (when clusters aren't ready) could re-serve an already-watched video.
+     Fixed by sharing the v2 picker's hard-exclude + oldest-first starvation
+     relaxation (`resolveClusterPool` renamed → `resolveExclusionPool`, since it's
+     no longer cluster-specific).
+  3. **`waitForVideo()` gave up permanently after one 8s miss**, stranding the
+     session with no overlay and no `ended` listener — nothing else re-triggers
+     `initAutoplay()` on the same URL. Fixed with `waitForVideoWithRetries()`:
+     3 attempts, then falls back to any `<video>` element found even if it never
+     hit `readyState >= 1`, so the user gets a Skip button instead of a dead tab.
+
+- **Uncommitted right now:** all three fixes above, `scripts/generate_narration.js`
+  (speed setting), `narration_manifest.js` (new bucket arrays), and the audio
+  directory itself (old flat-topic mp3s staged for deletion, new bucket folders
+  untracked). Worth a commit checkpoint before continuing.
 
 ---
 
-## Current selection system (v2 — what actually runs)
+## Selection system (v2 — what actually runs)
 
 ### Candidate pool
 Scraped from two sources, merged into `ytap_candidates` (max 100 entries):
@@ -112,11 +132,12 @@ Anchors = preference signal. They are intentionally kept separate.
    Numerically stable (subtract max before exp). Falls back to full `clusterInfos`
    if all clusters are below `COHERENCE_FLOOR`.
 
-9. **Pool resolution** (`resolveClusterPool`): hard-excludes any video in
-   `recentPicks` OR `ytap_watched` from the within-cluster pick pool. If exclusion
-   leaves fewer than `SEGMENT_SIZE` fresh candidates, relaxes oldest-first (by
-   `max(recentTs, watchedTs)` ascending) until the pool is refillable. Logs starvation
-   events. Never returns empty — absolute fallback is all available members.
+9. **Pool resolution** (`resolveExclusionPool` — shared with the legacy fallback
+   picker, see below): hard-excludes any video in `recentPicks` OR `ytap_watched`
+   from the within-cluster pick pool. If exclusion leaves fewer than `SEGMENT_SIZE`
+   fresh candidates, relaxes oldest-first (by `max(recentTs, watchedTs)` ascending)
+   until the pool is refillable. Logs starvation events. Never returns empty —
+   absolute fallback is all available members.
 
 10. **Anchor pick** (within cluster): score each candidate in the resolved pool as
     `(1 − VIEW_PRIOR_WEIGHT) × (sim × weight × channelScore) + VIEW_PRIOR_WEIGHT × viewPrior`,
@@ -127,6 +148,8 @@ Anchors = preference signal. They are intentionally kept separate.
     coherence; randomness within it breaks deterministic repeats.
 
 12. **Persist** segment, update `ytap_last_cluster`, call `addToRecentPicks(anchor.videoId)`.
+    Note: only the anchor is added here — fill videos (2–3) get added to `recentPicks`
+    when actually drained/served, not at segment-formation time.
 
 ### Scoring / feedback loop
 - **Natural end** (`signal = 1.0`): channel score rises (EMA `ALPHA_CHANNEL = 0.10`),
@@ -136,7 +159,8 @@ Anchors = preference signal. They are intentionally kept separate.
   update on skip.
 
 ### De-duplication
-Two independent layers:
+Two independent layers, both enforced via `resolveExclusionPool()` (used by both
+the v2 picker and the legacy fallback):
 - **`recentPicks`** — `{id, ts}[]`, max 100, persisted across sessions, 30-day TTL.
   Entries age out on read. **Not cleared on DJ restart** (DJ restart clears
   `ytap_current_segment` only). Hard-excludes from pick pool; starvation fallback
@@ -144,6 +168,45 @@ Two independent layers:
 - **`ytap_watched`** — `{videoId: timestamp}`, 90-day TTL, written on every natural
   completion. Longer-lived suppression that outlasts recentPicks age-out. Same
   starvation fallback rules.
+
+---
+
+## Narration system (Stage 3)
+
+Rewritten from per-topic lines to session-position/confidence-based lines — the old
+system named genres with confidence the clustering doesn't have, described mechanisms
+("subscriptions") the tool doesn't use, and played two clips back-to-back at DJ start.
+
+**11 buckets, 126 lines total**, all under `audio/<bucket>/`:
+- `cold_open` (16) — plays once at DJ start only. No genre named.
+- `cont_gaming` / `cont_tech` / `cont_finance` / `cont_science` / `cont_history` /
+  `cont_comedy` / `cont_food` / `cont_filmtv` (8 each) — mid-session, genre named but
+  softened ("history-flavored"), used when classification confidence clears the gate.
+- `continuation_generic` (30) — mid-session, below-confidence or unmatched genre
+  (also covers music/sports, which have no dedicated bucket — too thematically broad).
+- `skip_ack` (16) — plays only when a skip forms a **new segment** (not on every skip;
+  mid-segment skips that just drain the queue stay silent).
+
+**Runtime wiring** (`content.js`):
+- `classifyForNarration(centroid)` — cosine-classifies the chosen cluster's centroid
+  against `YTAP_TOPIC_CENTROIDS` (`topic_centroids.js`). Audio-only; never touches
+  selection.
+- `resolveContinuationBucket(seg)` — applies `NARRATION_CONFIDENCE_THRESHOLD (0.40)`
+  via `CONT_BUCKET_MAP` to pick `cont_<genre>` or fall back to `continuation_generic`.
+- `playNarration(bucket)` — picks a clip, excluding the last `ceil(bucketSize/2)`
+  played (FIFO), full-reset only if literally everything is excluded. Applies
+  `NARRATION_COOLDOWN_MS (20s)` cross-bucket suppression.
+- **Persistence**: `_narrationRecency` / `_lastNarrationTs` mirror to
+  `ytap_narration_recency` / `ytap_narration_last_ts` (see bug #1 above — this is
+  why it matters; every segment boundary is a hard navigation that resets in-memory
+  state).
+
+**Generation**: `scripts/generate_narration.js` reads every `audio/**/*.txt`, calls
+ElevenLabs (`eleven_multilingual_v2`), writes the `.mp3` alongside it with the same
+basename — filenames are fully determined by the `.txt` scripts, so the manifest can
+be (and was) filled in before generation ran. Skips any `.txt` with an existing `.mp3`,
+so reruns are cheap/safe. Current `VOICE_SETTINGS.speed = 0.9` (default is `1.0`,
+range `0.7–1.2`) — tuned down because the voice was reading too fast at default.
 
 ---
 
@@ -172,6 +235,8 @@ Two independent layers:
 | `RECENT_PICKS_MAX` | 100 | rolling cap on recentPicks array |
 | `RECENT_PICKS_TTL_MS` | 30 days | age-out for recentPicks entries |
 | `WATCHED_TTL_MS` | 90 days | suppression window for completed videos |
+| `NARRATION_CONFIDENCE_THRESHOLD` | 0.40 | min cosine to nearest topic centroid to use genre (`cont_*`) narration |
+| `NARRATION_COOLDOWN_MS` | 20,000 | suppress narration if another clip played within this window |
 
 ---
 
@@ -190,7 +255,7 @@ Two independent layers:
   explicitly stopped. One-pick-at-a-time doesn't solve decision paralysis.
 
 - **No runtime ElevenLabs API calls.** Narration MP3s are pre-generated
-  and bundled under `audio/{topic}/`. No API key ever touches the browser.
+  and bundled under `audio/<bucket>/`. No API key ever touches the browser.
 
 - **Tab scoping.** Only one DJ session runs at a time. `djTabId` tracks
   which tab owns it. Starting the DJ in a new tab takes over from any
@@ -201,6 +266,8 @@ Two independent layers:
   - `ytap_current_segment` — cleared on every new DJ session start
   - `ytap_channel_scores` — persists, decays 10% toward neutral each start
   - `ytap_clusters` / `ytap_taste_anchors` / `ytap_watched` — persist indefinitely
+  - `ytap_narration_recency` / `ytap_narration_last_ts` — persist indefinitely,
+    mirror in-memory narration state across hard navigations
   - `running` + `djTabId` — reset on browser startup via `onStartup`
 
 ---
@@ -210,6 +277,8 @@ Two independent layers:
 ```
 yt-autopilot/
 ├── manifest.json          # MV3, permissions: storage + activeTab + offscreen
+│                          #   web_accessible_resources: audio/*/*.mp3 (wildcard,
+│                          #   covers any bucket folder name without edits)
 ├── background.js          # service worker — resets state on startup,
 │                          #   routes GET_TAB_ID / EMBED / EMBED_AND_STORE
 │                          #   messages between content script and offscreen
@@ -224,28 +293,30 @@ yt-autopilot/
 │                          #   NOT used in selection path.
 ├── topic_centroids.js     # auto-generated 384-float centroid per topic;
 │                          #   regenerate via `node scripts/generate_centroids.js`
-├── narration_manifest.js  # YTAP_NARRATION — maps topic → [clip filenames]
+├── narration_manifest.js  # YTAP_NARRATION — maps bucket → [clip filenames];
+│                          #   11 live buckets + legacy topic buckets (inert,
+│                          #   audio deleted, see Deprecated section)
 ├── popup.html/.js         # toolbar icon — Start/Stop + Reset taste profile +
 │                          #   pool-thin warning when embedded < 30
-├── audio/                 # pre-generated MP3s, 3 clips per topic bucket
-│   ├── intro/             #   int01-03.mp3
-│   ├── gaming/            #   gam01-03.mp3
-│   ├── tech/              #   tec01-03.mp3
-│   ├── finance/           #   fin01-03.mp3
-│   ├── science/           #   sci01-03.mp3
-│   ├── history/           #   his01-03.mp3
-│   ├── comedy/            #   com01-03.mp3
-│   ├── music/             #   mus01-03.mp3
-│   ├── sports/            #   spt01-03.mp3
-│   ├── food/              #   fod01-03.mp3
-│   ├── film_tv/           #   ftv01-03.mp3
-│   ├── commentary/        #   cmt01-03.mp3
-│   └── general/           #   gen01-03.mp3
+├── audio/                 # pre-generated MP3s + source .txt scripts, one
+│                          #   subfolder per narration bucket:
+│   ├── cold_open/         #   16 clips — co01-16.mp3
+│   ├── cont_gaming/       #   8 clips  — cgam01-08.mp3
+│   ├── cont_tech/         #   8 clips  — ctec01-08.mp3
+│   ├── cont_finance/      #   8 clips  — cfin01-08.mp3
+│   ├── cont_science/      #   8 clips  — csci01-08.mp3
+│   ├── cont_history/      #   8 clips  — chis01-08.mp3
+│   ├── cont_comedy/       #   8 clips  — ccom01-08.mp3
+│   ├── cont_food/         #   8 clips  — cfod01-08.mp3
+│   ├── cont_filmtv/       #   8 clips  — cftv01-08.mp3
+│   ├── continuation_generic/ # 30 clips — cg01-30.mp3
+│   └── skip_ack/          #   16 clips — sk01-16.mp3
 ├── models/Xenova/all-MiniLM-L6-v2/   # quantized ONNX model (bundled, ~22MB)
 ├── scripts/
 │   ├── setup_assets.js        # copies WASM + transformers bundle to extension root
 │   ├── generate_centroids.js  # re-embeds topic descriptions → topic_centroids.js
-│   └── generate_narration.js  # batch-generates MP3s via ElevenLabs API
+│   └── generate_narration.js  # batch-generates MP3s via ElevenLabs API;
+│                              #   ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID env vars
 └── icons/
 ```
 
@@ -268,6 +339,8 @@ yt-autopilot/
 | `ytap_last_cluster` | index of last segment's cluster (for penalty + discovery) |
 | `ytap_current_segment` | `{clusterIdx, videos, segmentIndex}` — cleared on session start |
 | `ytap_watched` | `{videoId: timestamp}` — 90-day completed-video suppression |
+| `ytap_narration_recency` | `{bucket: filename[]}` — mirrors `_narrationRecency`, survives hard navigations |
+| `ytap_narration_last_ts` | timestamp of last narration play — mirrors `_lastNarrationTs` for cooldown |
 
 ---
 
@@ -275,7 +348,9 @@ yt-autopilot/
 
 The following keys and functions exist in `content.js` but belong to the legacy
 selection path (`pickNextLegacy` / `formSegment`). They will be deleted in Stage 4.
-Do not reference them in new code or rely on them being present.
+Do not reference them in new code or rely on them being present. Note: the legacy
+*picker* itself was recently upgraded (see bug #2 above) so it now shares de-dup
+behavior with v2 — it's a safer fallback than before, just still slated for removal.
 
 **Storage keys (legacy only):**
 | Key | Description |
@@ -293,6 +368,14 @@ Do not reference them in new code or rely on them being present.
 - `TOPIC_ADJACENCY` map — defines which topics are "adjacent" for discovery
 - `YTAP_CLASSIFY_VEC` call sites in the selection path
 
+**Legacy narration buckets** in `narration_manifest.js` (`intro`, `gaming`, `tech`,
+`finance`, `science`, `history`, `comedy`, `music`, `sports`, `food`, `film_tv`,
+`commentary`, `general`) — their backing MP3s/scripts are already deleted from disk
+(git deletion staged, uncommitted). The manifest entries are dead references: nothing
+in the live narration call path (`playNarration('cold_open')`, `playNarration('skip_ack')`,
+`playNarration(resolveContinuationBucket(seg))`) ever requests them. Safe to delete
+outright whenever Stage 4 cleanup happens.
+
 **What the legacy system did (for reference only):**
 Picked an anchor via `blendedWeight(channelScore + cosineSim(embedding, tasteVector[topic]) + viewCount)`,
 filled up to 3 by cosine similarity to anchor (threshold 0.30), classified the segment
@@ -302,6 +385,10 @@ jumping to an adjacent topic from `TOPIC_ADJACENCY`. This is no longer the activ
 ---
 
 ## Known issues / active improvement areas
+
+- **Narration audio pacing** — `speed = 0.9` in `generate_narration.js` fixed the
+  "reading too fast" complaint; whether the lines also need to be lengthened
+  (currently 9–17 words) is still open. Pick up here next session.
 
 - **YouTube DOM changes** — scraping selectors in `getCandidates()` will break
   occasionally. `getCandidates()` in `content.js` is the place to fix them.
