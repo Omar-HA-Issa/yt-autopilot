@@ -1526,18 +1526,16 @@ async function initAutoplay() {
 // ─── DJ start ─────────────────────────────────────────────────────────────────
 // Shared by the PICK_NEXT message (normal start, content script already live)
 // and checkPendingStart() (start was deferred across a navigation/reload
-// because the content script wasn't injected yet when the popup tried).
+// because the content script wasn't injected yet when the popup tried). Both
+// callers set running: true themselves before calling this — pickNext() can
+// take 15s+ on a cold start, and the popup that triggered PICK_NEXT is long
+// gone by the time it resolves (it closes right after the ack), so running
+// can't depend on anything the popup does after sending the message.
 
-// onPickResolved (if given) fires the instant the pick itself is known — i.e.
-// before narration/navigation. PICK_NEXT's sendResponse must happen there, not
-// after this function returns: window.location.href below tears down this
-// context, which can drop a response sent only after navigation starts and
-// make a real success look like a dead message channel to the caller.
-async function runDjStartPick(onPickResolved) {
+async function runDjStartPick() {
   showDJSplash();
   try {
     const pick = await pickNext();
-    onPickResolved?.(pick);
     if (pick) {
       await playNarration('cold_open');
       hideDJSplash();
@@ -1551,7 +1549,6 @@ async function runDjStartPick(onPickResolved) {
   } catch (err) {
     console.error('[yt-autopilot] DJ start pick error:', err);
     hideDJSplash();
-    onPickResolved?.(null);
     return null;
   }
 }
@@ -1584,8 +1581,17 @@ async function checkPendingStart() {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'PICK_NEXT') {
     console.log('[yt-autopilot] PICK_NEXT received');
-    runDjStartPick(pick => { try { sendResponse({ pick }); } catch (_) {} });
-    return true; // keep channel open for async response
+    // Ack immediately, before any work — the popup only needs to know delivery
+    // succeeded (to decide whether to reload instead) and then closes. Setting
+    // running here, not in the popup, means the DJ keeps going even if the
+    // popup closes (or the user clicks away) long before pickNext() resolves.
+    try { sendResponse({ ok: true }); } catch (_) {}
+    (async () => {
+      const myTabId = await getMyTabId();
+      await setStored({ running: true, djTabId: myTabId });
+      await runDjStartPick();
+    })();
+    return; // sendResponse already fired synchronously above — nothing to keep open
   }
 });
 
