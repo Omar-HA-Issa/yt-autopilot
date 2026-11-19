@@ -98,6 +98,7 @@ function getCandidates() {
 
 function getMyTabId() {
   return new Promise(resolve => {
+    if (!chrome.runtime?.id) { resolve(null); return; }
     chrome.runtime.sendMessage({ type: 'GET_TAB_ID' }, res => {
       void chrome.runtime.lastError;
       resolve(res?.tabId ?? null);
@@ -107,26 +108,46 @@ function getMyTabId() {
 
 // ─── Storage helpers ──────────────────────────────────────────────────────────
 
-const RECENT_PICKS_MAX = 25;
+const RECENT_PICKS_MAX    = 100;                         // rolling cap on persisted recentPicks
+const RECENT_PICKS_TTL_MS = 30 * 24 * 60 * 60 * 1000;  // 30-day age-out for recentPicks entries
+const WATCHED_TTL_MS      = 90 * 24 * 60 * 60 * 1000;  // 90-day suppression for completed videos
 
 function getStored(key) {
-  return new Promise(resolve => chrome.storage.local.get(key, data => resolve(data[key])));
+  return new Promise(resolve => {
+    if (!chrome.runtime?.id) { resolve(undefined); return; }
+    chrome.storage.local.get(key, data => resolve(data[key]));
+  });
 }
 
 function setStored(obj) {
-  return new Promise(resolve => chrome.storage.local.set(obj, resolve));
+  return new Promise(resolve => {
+    if (!chrome.runtime?.id) { resolve(); return; }
+    chrome.storage.local.set(obj, resolve);
+  });
 }
 
 function getRecentPicks() {
   return new Promise(resolve => {
-    chrome.storage.local.get('recentPicks', ({ recentPicks }) => resolve(recentPicks || []));
+    if (!chrome.runtime?.id) { resolve([]); return; }
+    chrome.storage.local.get('recentPicks', ({ recentPicks }) => {
+      const now = Date.now();
+      const entries = (recentPicks || [])
+        .map(x => typeof x === 'string' ? { id: x, ts: now } : x) // migrate plain-string format
+        .filter(x => now - x.ts < RECENT_PICKS_TTL_MS);
+      resolve(entries);
+    });
   });
 }
 
 function addToRecentPicks(videoId) {
   return getRecentPicks().then(picks => {
-    const updated = [videoId, ...picks.filter(id => id !== videoId)].slice(0, RECENT_PICKS_MAX);
-    return new Promise(resolve => chrome.storage.local.set({ recentPicks: updated }, resolve));
+    const now     = Date.now();
+    const updated = [{ id: videoId, ts: now }, ...picks.filter(x => x.id !== videoId)]
+      .slice(0, RECENT_PICKS_MAX);
+    return new Promise(resolve => {
+      if (!chrome.runtime?.id) { resolve(); return; }
+      chrome.storage.local.set({ recentPicks: updated }, resolve);
+    });
   });
 }
 
@@ -152,7 +173,27 @@ async function embedTexts(texts, timeoutMs = 30000) {
 // ─── Taste profile (5b) ───────────────────────────────────────────────────────
 
 const EMBED_DIM   = 384;
-const TASTE_ALPHA = 0.15; // higher than channel α — topical taste drifts faster
+
+// ─── Tunable constants ────────────────────────────────────────────────────────
+const CLUSTER_K               = 10;   // number of embedding clusters
+const SEGMENT_SIZE            = 3;    // videos per segment; also the runt-guard minimum
+const TEMPERATURE             = 0.4;  // softmax temperature for cluster selection
+const RECENTLY_PLAYED_PENALTY = 1.5;  // subtracted from cluster affinity for recently-played clusters
+const COHERENCE_WEIGHT        = 1.0;  // exponent on per-cluster coherence in softmax (0 = off)
+const COHERENCE_FLOOR         = 0.40; // clusters below this coherence are hard-excluded from the main softmax
+const DISCOVERY_RATE          = 0.10; // probability of picking a nearby under-watched cluster
+const VIEW_PRIOR_WEIGHT       = 0.15; // weight of log-view-count in within-cluster pick score
+const ANCHOR_NEW_THRESHOLD    = 0.50; // min cosine to nearest anchor before creating a new one
+const ANCHOR_SKIP_SIM         = 0.95; // above this sim the vector nudge is a near-no-op; bump weight only
+const ANCHOR_MAX              = 10;   // maximum number of taste anchors
+const ALPHA_CENTROID          = 0.10; // EMA: cluster centroid nudge toward new members
+const ALPHA_ANCHOR_VEC        = 0.15; // EMA: taste-anchor vector nudge toward completions
+const ALPHA_ANCHOR_WEIGHT     = 0.20; // EMA: taste-anchor weight bump on a hit
+const ALPHA_CHANNEL           = 0.10; // EMA: channel score
+const POOL_BOOTSTRAP_THRESHOLD = 30; // embedded candidates below this → bootstrap before cluster selection
+const FILL_TOP_N               = 5;  // top candidates eligible for weighted-random fill (coherence gate)
+const NARRATION_CONFIDENCE_THRESHOLD = 0.40; // min cosine to nearest topic centroid to use genre narration; below this → generic fallback
+const NARRATION_COOLDOWN_MS          = 20 * 1000; // suppress narration if another clip played within this window
 
 function cosineSim(a, b) {
   let dot = 0, magA = 0, magB = 0;
@@ -165,26 +206,88 @@ function cosineSim(a, b) {
   return denom === 0 ? 0 : dot / denom;
 }
 
-async function updateTasteVector(embedding, topic) {
-  if (!embedding || embedding.length !== EMBED_DIM || !topic) return;
-  const allVecs = (await getStored('ytap_taste_vectors')) || {};
-  const stored = allVecs[topic] || new Array(EMBED_DIM).fill(0);
-  const updated = stored.map((v, i) => v * (1 - TASTE_ALPHA) + embedding[i] * TASTE_ALPHA);
-  const mag = Math.sqrt(updated.reduce((s, x) => s + x * x, 0));
-  allVecs[topic] = mag > 0 ? updated.map(x => x / mag) : updated;
-  await setStored({ ytap_taste_vectors: allVecs });
+function normalizeVec(v) {
+  const mag = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
+  return mag > 0 ? v.map(x => x / mag) : v;
 }
 
-function blendedWeight(channelScore, embedding, tasteVectors, watchCounts, topic) {
-  const tasteVector = tasteVectors?.[topic] ?? null;
-  const watchCount = watchCounts?.[topic] ?? 0;
-  if (!tasteVector || !embedding) return channelScore;
-  const simNorm = (cosineSim(embedding, tasteVector) + 1) / 2; // [-1,1] → [0,1]
-  const tw = Math.min(0.6, (watchCount / 10) * 0.6); // ramps 0→0.6 over first 10 natural ends
-  return (1 - tw) * channelScore + tw * simNorm;
+// ─── Clustering (warm-started k-means, k=CLUSTER_K) ──────────────────────────
+
+function kmeansppInit(embeddings, k) {
+  const centroids = [embeddings[Math.floor(Math.random() * embeddings.length)]];
+  while (centroids.length < k) {
+    // Cosine distance = 1 − cosine_similarity (higher distance → more likely to be picked)
+    const dists = embeddings.map(e => {
+      let best = -Infinity;
+      for (const c of centroids) { const s = cosineSim(c, e); if (s > best) best = s; }
+      return Math.max(0, 1 - best);
+    });
+    const total = dists.reduce((a, b) => a + b, 0);
+    let picked = embeddings[0];
+    if (total > 0) {
+      let r = Math.random() * total;
+      for (let i = 0; i < embeddings.length; i++) {
+        r -= dists[i];
+        if (r <= 0) { picked = embeddings[i]; break; }
+      }
+    }
+    centroids.push(picked);
+  }
+  return centroids;
+}
+
+async function updateClusters(embeddedCandidates) {
+  if (!embeddedCandidates.length) return;
+
+  const stored = (await getStored('ytap_clusters')) || { centroids: [], members: {} };
+  let { centroids, members } = stored;
+
+  // Cold start: no valid centroids — run k-means++ initialisation
+  if (!Array.isArray(centroids) || centroids.length !== CLUSTER_K) {
+    if (embeddedCandidates.length < CLUSTER_K) {
+      console.log('[yt-autopilot] clustering: cold start deferred — need ≥', CLUSTER_K, 'embedded candidates, have', embeddedCandidates.length);
+      return;
+    }
+    console.log('[yt-autopilot] clustering: cold start k-means++ with', embeddedCandidates.length, 'candidates');
+    centroids = kmeansppInit(embeddedCandidates.map(c => c.embedding), CLUSTER_K);
+    members = {};
+    for (let i = 0; i < CLUSTER_K; i++) members[i] = [];
+    for (const c of embeddedCandidates) {
+      let bestIdx = 0, bestSim = -Infinity;
+      for (let i = 0; i < centroids.length; i++) {
+        const s = cosineSim(c.embedding, centroids[i]);
+        if (s > bestSim) { bestSim = s; bestIdx = i; }
+      }
+      if (!members[bestIdx].includes(c.videoId)) members[bestIdx].push(c.videoId);
+    }
+    await setStored({ ytap_clusters: { centroids, members } });
+    console.log('[yt-autopilot] clustering: cold start done, sizes:', Object.values(members).map(m => m.length));
+    return;
+  }
+
+  // Warm start: assign each candidate to its nearest centroid, nudge the centroid
+  let changed = false;
+  for (const c of embeddedCandidates) {
+    let bestIdx = 0, bestSim = -Infinity;
+    for (let i = 0; i < centroids.length; i++) {
+      const s = cosineSim(c.embedding, centroids[i]);
+      if (s > bestSim) { bestSim = s; bestIdx = i; }
+    }
+    if (!members[bestIdx]) members[bestIdx] = [];
+    if (!members[bestIdx].includes(c.videoId)) {
+      members[bestIdx].push(c.videoId);
+      centroids[bestIdx] = normalizeVec(
+        centroids[bestIdx].map((v, i) => v * (1 - ALPHA_CENTROID) + c.embedding[i] * ALPHA_CENTROID)
+      );
+      changed = true;
+    }
+  }
+
+  if (changed) await setStored({ ytap_clusters: { centroids, members } });
 }
 
 function embedCandidatesAsync(candidates) {
+  if (!chrome.runtime?.id) return;
   // Fire and forget — offscreen document embeds and writes to storage directly.
   // No response expected so page navigation doesn't break anything.
   chrome.runtime.sendMessage({ type: 'EMBED_AND_STORE', candidates }, () => {
@@ -192,201 +295,523 @@ function embedCandidatesAsync(candidates) {
   });
 }
 
-// ─── Segment logic (5c / Phase 6) ────────────────────────────────────────────
-
-const SEGMENT_SIZE  = 3;
-const SIM_THRESHOLD = 0.30;
-
-const TOPIC_ADJACENCY = {
-  gaming:      ['tech', 'commentary', 'film_tv'],
-  tech:        ['science', 'gaming', 'finance'],
-  finance:     ['commentary', 'tech', 'history'],
-  science:     ['history', 'tech', 'film_tv'],
-  history:     ['science', 'commentary', 'film_tv'],
-  comedy:      ['commentary', 'film_tv', 'music'],
-  music:       ['comedy', 'film_tv', 'sports'],
-  sports:      ['commentary', 'music', 'food'],
-  food:        ['comedy', 'sports', 'film_tv'],
-  film_tv:     ['comedy', 'music', 'commentary'],
-  commentary:  ['comedy', 'film_tv', 'history'],
-  general:     ['comedy', 'film_tv', 'music'],
-};
-
-function segmentCentroid(segment) {
-  const embeds = segment.filter(c => c.embedding);
-  if (!embeds.length) return null;
-  const avg = new Array(EMBED_DIM).fill(0);
-  for (const c of embeds) {
-    for (let i = 0; i < EMBED_DIM; i++) avg[i] += c.embedding[i];
-  }
-  const mag = Math.sqrt(avg.reduce((s, x) => s + x * x, 0));
-  return mag > 0 ? avg.map(x => x / mag) : null;
-}
-
-function candidateTopic(c) {
-  if (c.embedding && typeof YTAP_CLASSIFY_VEC !== 'undefined') return YTAP_CLASSIFY_VEC(c.embedding);
-  if (typeof YTAP_CLASSIFY !== 'undefined') return YTAP_CLASSIFY([c.title]);
-  return 'general';
-}
-
-function formSegment(pool, scores, tasteVectors, watchCounts, lastTopic = null) {
-  // Prefer embedded candidates as anchor — filling only works when anchor has an embedding.
-  const poolWithEmbed = pool.filter(c => c.embedding);
-  let anchorPool = poolWithEmbed.length > 0 ? poolWithEmbed : pool;
-
-  // Discovery mode — 10% of the time after 5+ watched videos, pick from an
-  // adjacent unexplored topic to introduce novelty.
-  const totalWatched = Object.values(watchCounts || {}).reduce((a, b) => a + b, 0);
-  let discoveryFired = false;
-  if (totalWatched >= 5 && Math.random() < 0.10) {
-    const dominantTopic = Object.entries(watchCounts).sort((a, b) => b[1] - a[1])[0]?.[0];
-    const adjacent = TOPIC_ADJACENCY[dominantTopic] || [];
-    const unexplored = adjacent.filter(t => !watchCounts[t]);
-    const discoveryTopic = unexplored[Math.floor(Math.random() * unexplored.length)];
-    if (discoveryTopic) {
-      const discoveryPool = anchorPool.filter(c => candidateTopic(c) === discoveryTopic);
-      if (discoveryPool.length > 0) {
-        console.log('[yt-autopilot] discovery mode:', dominantTopic, '→', discoveryTopic);
-        anchorPool = discoveryPool;
-        discoveryFired = true;
-      }
-    }
-  }
-
-  // Avoid repeating the last segment's topic when alternatives exist (skip if discovery already picked).
-  if (!discoveryFired && lastTopic && lastTopic !== 'general' && anchorPool.length > 1) {
-    const altPool = anchorPool.filter(c => candidateTopic(c) !== lastTopic);
-    if (altPool.length > 0) {
-      console.log('[yt-autopilot] topic diversity: excluding', lastTopic, '→', altPool.length, 'candidates');
-      anchorPool = altPool;
-    }
-  }
-
-  const anchor = weightedPick(anchorPool, scores, tasteVectors, watchCounts);
-  const segment = [anchor];
-  const rest = pool.filter(c => c.videoId !== anchor.videoId);
-
-  const withEmbed = rest.filter(c => c.embedding);
-  if (anchor.embedding && withEmbed.length > 0) {
-    const ranked = withEmbed
-      .map(c => ({ ...c, _sim: cosineSim(c.embedding, anchor.embedding) }))
-      .filter(c => c._sim >= SIM_THRESHOLD)
-      .sort((a, b) => b._sim - a._sim);
-
-    while (segment.length < SEGMENT_SIZE && ranked.length) {
-      const next = ranked.shift();
-      delete next._sim;
-      segment.push(next);
-    }
-  }
-
-  // Classify using segment centroid vector (Phase 6); fall back to keyword matching.
-  const centroid = segmentCentroid(segment);
-  const topic = (centroid && typeof YTAP_CLASSIFY_VEC !== 'undefined' && YTAP_CLASSIFY_VEC(centroid))
-    ?? (typeof YTAP_CLASSIFY !== 'undefined' ? YTAP_CLASSIFY(segment.map(c => c.title)) : 'general');
-
-  console.log('[yt-autopilot] formSegment topic:', topic, segment.map(v => v.title));
-  return { topic, videos: segment };
-}
-
 function willStartNewSegment(seg) {
   return !seg || seg.segmentIndex >= seg.videos.length;
 }
 
-// ─── Pick logic ───────────────────────────────────────────────────────────────
+// ─── Taste anchors (v2) ───────────────────────────────────────────────────────
 
-async function pickNext() {
-  // Drain the current segment before forming a new one.
+function nearestAnchorScore(embedding, anchors) {
+  if (!anchors || !anchors.length || !embedding) return { sim: 1.0, weight: 1.0 };
+  let bestSim = -Infinity, bestWeight = 1.0;
+  for (const a of anchors) {
+    const s = cosineSim(embedding, a.centroid);
+    if (s > bestSim) { bestSim = s; bestWeight = a.weight; }
+  }
+  return { sim: Math.max(0, bestSim), weight: bestWeight };
+}
+
+async function updateTasteAnchors(embedding) {
+  if (!embedding || embedding.length !== EMBED_DIM) return;
+  const anchors = (await getStored('ytap_taste_anchors')) || [];
+
+  let nearestIdx = -1, nearestSim = -Infinity;
+  for (let i = 0; i < anchors.length; i++) {
+    const s = cosineSim(embedding, anchors[i].centroid);
+    if (s > nearestSim) { nearestSim = s; nearestIdx = i; }
+  }
+
+  let logMsg;
+  if (nearestIdx >= 0 && nearestSim >= ANCHOR_NEW_THRESHOLD) {
+    const a = anchors[nearestIdx];
+    if (nearestSim > ANCHOR_SKIP_SIM) {
+      // Degenerate nudge: anchor already aligned to this video's embedding.
+      // Bumping weight only keeps the anchor's influence growing without pinning
+      // the centroid to a single video on re-watch.
+      anchors[nearestIdx] = { centroid: a.centroid, weight: a.weight * (1 - ALPHA_ANCHOR_WEIGHT) + ALPHA_ANCHOR_WEIGHT };
+      logMsg = 'skip sim=' + nearestSim.toFixed(3);
+    } else {
+      anchors[nearestIdx] = {
+        centroid: normalizeVec(a.centroid.map((v, j) => v * (1 - ALPHA_ANCHOR_VEC) + embedding[j] * ALPHA_ANCHOR_VEC)),
+        weight:   a.weight * (1 - ALPHA_ANCHOR_WEIGHT) + ALPHA_ANCHOR_WEIGHT,
+      };
+      logMsg = 'nudge sim=' + nearestSim.toFixed(3);
+    }
+  } else if (anchors.length < ANCHOR_MAX) {
+    anchors.push({ centroid: [...embedding], weight: ALPHA_ANCHOR_WEIGHT });
+    logMsg = 'new';
+  } else {
+    // All ANCHOR_MAX anchors full and all far — nudge nearest anyway (taste changes slowly)
+    const a = anchors[nearestIdx];
+    if (nearestSim > ANCHOR_SKIP_SIM) {
+      anchors[nearestIdx] = { centroid: a.centroid, weight: a.weight * (1 - ALPHA_ANCHOR_WEIGHT) + ALPHA_ANCHOR_WEIGHT };
+      logMsg = 'full/skip sim=' + nearestSim.toFixed(3);
+    } else {
+      anchors[nearestIdx] = {
+        centroid: normalizeVec(a.centroid.map((v, j) => v * (1 - ALPHA_ANCHOR_VEC) + embedding[j] * ALPHA_ANCHOR_VEC)),
+        weight:   a.weight * (1 - ALPHA_ANCHOR_WEIGHT) + ALPHA_ANCHOR_WEIGHT,
+      };
+      logMsg = 'full/nudge sim=' + nearestSim.toFixed(3);
+    }
+  }
+
+  await setStored({ ytap_taste_anchors: anchors });
+  console.log('[yt-autopilot] taste anchors:', anchors.length, logMsg);
+}
+
+// ─── Pool bootstrap (A + C) ───────────────────────────────────────────────────
+
+// Fetches /feed/subscriptions and extracts video candidates from the ytInitialData
+// JSON blob that YouTube server-renders into the initial HTML. Returns a filtered
+// candidate array on success, or null if the fetch/parse failed outright.
+// A result with < 5 entries means parse succeeded but the renderer tree was wrong
+// (logged-out, consent wall, auth state) — caller distinguishes these two cases.
+async function fetchFeedCandidates() {
+  try {
+    const html = await fetch('https://www.youtube.com/feed/subscriptions').then(r => r.text());
+
+    // Brace-count extraction: more reliable than a regex on a multi-MB blob.
+    const marker   = 'var ytInitialData = ';
+    const jsonStart = html.indexOf(marker);
+    if (jsonStart === -1) {
+      console.log('[yt-autopilot] bootstrap A: ytInitialData marker missing — likely a login/consent page');
+      return null;
+    }
+    let depth = 0, i = jsonStart + marker.length;
+    for (; i < html.length; i++) {
+      if (html[i] === '{') depth++;
+      else if (html[i] === '}') { if (--depth === 0) { i++; break; } }
+    }
+    let data;
+    try {
+      data = JSON.parse(html.slice(jsonStart + marker.length, i));
+    } catch (e) {
+      console.log('[yt-autopilot] bootstrap A: ytInitialData JSON parse threw:', e.message);
+      return null;
+    }
+
+    // Standard subscription feed path — richGridRenderer has been stable since ~2021.
+    // If this path is absent (wrong auth state, layout change) contents will be [].
+    const contents = data?.contents
+      ?.twoColumnBrowseResultsRenderer
+      ?.tabs?.[0]?.tabRenderer?.content
+      ?.richGridRenderer?.contents ?? [];
+
+    const candidates = [];
+    for (const item of contents) {
+      const v = item?.richItemRenderer?.content?.videoRenderer;
+      if (!v?.videoId) continue;
+
+      const title = v.title?.runs?.[0]?.text;
+      if (!title) continue;
+      const channel = v.shortBylineText?.runs?.[0]?.text;
+      if (!channel) continue;
+
+      // Live / Shorts — mirrors the overlayStyle check in getCandidates()
+      const overlayStyle = v.thumbnailOverlays
+        ?.find(o => o.thumbnailOverlayTimeStatusRenderer)
+        ?.thumbnailOverlayTimeStatusRenderer?.style;
+      if (overlayStyle === 'LIVE' || overlayStyle === 'SHORTS') continue;
+
+      // Duration — same parseDuration() + MIN_DURATION_SEC as DOM scraper
+      const duration = parseDuration(v.lengthText?.simpleText);
+      if (duration === null || duration < MIN_DURATION_SEC) continue;
+
+      // Views — same parseViews() + MIN_VIEWS_HARD as DOM scraper
+      const viewStr = v.viewCountText?.simpleText
+        ?? v.viewCountText?.runs?.map(r => r.text).join('');
+      const views = parseViews(viewStr);
+      if (views > 0 && views < MIN_VIEWS_HARD) continue;
+
+      // News patterns — same filter as DOM scraper
+      if (NEWS_PATTERNS.some(p => title.toLowerCase().includes(p))) continue;
+
+      candidates.push({ videoId: v.videoId, title, channel, views });
+    }
+    return candidates;
+  } catch (err) {
+    console.log('[yt-autopilot] bootstrap A: fetch threw:', err.message);
+    return null;
+  }
+}
+
+// Merges a fresh batch of candidates into the stored pool with the same
+// dedup / retain / embed logic used everywhere else in the pipeline.
+async function mergeIntoCandidatePool(fresh) {
+  if (!fresh.length) return;
+  const prev          = (await getStored('ytap_candidates')) || [];
+  const prevById      = Object.fromEntries(prev.map(c => [c.videoId, c]));
+  const freshWithEmbed = fresh.map(c => ({ ...c, embedding: prevById[c.videoId]?.embedding }));
+  const newIds        = new Set(fresh.map(c => c.videoId));
+  const retained      = prev.filter(c => !newIds.has(c.videoId) && !(c.views > 0 && c.views < MIN_VIEWS_HARD));
+  const merged        = [...freshWithEmbed, ...retained].slice(0, 100);
+  await setStored({ ytap_candidates: merged });
+  await updateClusters(merged.filter(c => c.embedding));
+  embedCandidatesAsync(freshWithEmbed.filter(c => !c.embedding));
+}
+
+// Fires when the embedded pool is thin at DJ start. Tries A (ytInitialData fetch)
+// first, falls through to C (immediate sidebar scrape) regardless of A's outcome.
+async function bootstrapPool() {
+  // A: subscription feed via ytInitialData
+  const feedCandidates = await fetchFeedCandidates();
+  if (feedCandidates === null) {
+    console.log('[yt-autopilot] bootstrap: A failed (fetch/parse error) — sidebar only');
+  } else if (feedCandidates.length < 5) {
+    console.log('[yt-autopilot] bootstrap: A returned', feedCandidates.length,
+      'candidates (auth/consent state?) — sidebar only');
+  } else {
+    console.log('[yt-autopilot] bootstrap: A fetched', feedCandidates.length, 'from feed');
+    await mergeIntoCandidatePool(feedCandidates);
+  }
+
+  // C: immediate sidebar scrape — complement to A, or sole source when A fails
+  const sidebarFresh = getCandidates();
+  if (sidebarFresh.length) {
+    console.log('[yt-autopilot] bootstrap: C sidebar gave', sidebarFresh.length, 'candidates');
+    await mergeIntoCandidatePool(sidebarFresh);
+  } else {
+    console.log('[yt-autopilot] bootstrap: C sidebar empty on this page type');
+  }
+}
+
+// ─── Exclusion pool resolver ───────────────────────────────────────────────────
+// Hard-excludes recently-picked and long-watched videos from a candidate pool.
+// If exclusion would leave fewer than SEGMENT_SIZE candidates, relaxes the
+// exclusion oldest-first (across both sets combined) until the pool is refillable.
+// Never returns an empty pool — worst case it returns all available videos.
+// Shared by the v2 cluster picker and the legacy fallback picker.
+function resolveExclusionPool(available, recentPicks, watchedMap) {
+  const recentById = Object.fromEntries(recentPicks.map(x => [x.id, x.ts]));
+
+  const fresh    = [];
+  const excluded = []; // { c, lastSeenTs }
+
+  for (const c of available) {
+    const recentTs  = recentById[c.videoId];
+    const watchedTs = watchedMap[c.videoId];
+    if (recentTs === undefined && watchedTs === undefined) {
+      fresh.push(c);
+    } else {
+      // lastSeenTs = most recent time this video appeared in either exclusion set
+      excluded.push({ c, lastSeenTs: Math.max(recentTs ?? 0, watchedTs ?? 0) });
+    }
+  }
+
+  if (fresh.length >= SEGMENT_SIZE) return fresh;
+
+  // Starvation: add back the oldest-seen excluded videos first
+  excluded.sort((a, b) => a.lastSeenTs - b.lastSeenTs);
+  const pool = [...fresh];
+  for (const { c } of excluded) {
+    if (pool.length >= SEGMENT_SIZE) break;
+    pool.push(c);
+  }
+  if (pool.length < available.length) {
+    console.log('[yt-autopilot] starvation fallback: pool relaxed',
+      pool.length - fresh.length, 'exclusions (oldest-first),', fresh.length, 'fresh');
+  }
+  return pool.length > 0 ? pool : available; // absolute last resort: all members
+}
+
+// ─── New pick loop (v2) ───────────────────────────────────────────────────────
+
+async function pickNextNew(coldStartRetried = false) {
+  // 1. Drain current segment first
   const seg = await getStored('ytap_current_segment');
   if (seg && seg.segmentIndex < seg.videos.length) {
     const pick = seg.videos[seg.segmentIndex];
     await setStored({ ytap_current_segment: { ...seg, segmentIndex: seg.segmentIndex + 1 } });
-    console.log('[yt-autopilot] segment drain [', seg.segmentIndex + 1, '/', seg.videos.length, ']', seg.topic, pick.title);
+    console.log('[yt-autopilot] v2 drain [', seg.segmentIndex + 1, '/', seg.videos.length, '] cluster', seg.clusterIdx, pick.title);
     await addToRecentPicks(pick.videoId);
     return pick;
   }
 
-  // Segment exhausted or none — build a new one.
-  let candidates = getCandidates();
-
-  if (!candidates.length && location.pathname !== '/watch') {
-    for (let i = 0; i < 5 && !candidates.length; i++) {
-      await new Promise(r => setTimeout(r, 800));
-      candidates = getCandidates();
-    }
+  // Bootstrap: if the embedded pool is thin, populate it before cluster selection.
+  // Runs only when needed — once pool reaches POOL_BOOTSTRAP_THRESHOLD this check
+  // is a single fast storage read and the await resolves immediately.
+  const _preCands = (await getStored('ytap_candidates')) || [];
+  if (_preCands.filter(c => c.embedding).length < POOL_BOOTSTRAP_THRESHOLD) {
+    await bootstrapPool();
   }
 
-  console.log('[yt-autopilot] getCandidates() returned', candidates.length, 'on', location.pathname);
+  // 2. Load all state in parallel
+  const [clusterData, storedCandidates, channelScores, tasteAnchors, recentPicks, rawWatched, lastCluster, totalCompletions] = await Promise.all([
+    getStored('ytap_clusters'),
+    getStored('ytap_candidates'),
+    getStored('ytap_channel_scores'),
+    getStored('ytap_taste_anchors'),
+    getRecentPicks(),
+    getStored('ytap_watched'),
+    getStored('ytap_last_cluster'),
+    getStored('ytap_total_completions'),
+  ]);
 
-  if (candidates.length) {
-    // Merge with stored pool — keep embeddings, drop stale no-views entries, cap at 100
-    const prev = (await getStored('ytap_candidates')) || [];
-    const prevById = Object.fromEntries(prev.map(c => [c.videoId, c]));
-    const freshWithEmbed = candidates.map(c => ({ ...c, embedding: prevById[c.videoId]?.embedding }));
-    const newIds = new Set(candidates.map(c => c.videoId));
-    const retained = prev.filter(c => !newIds.has(c.videoId) && !(c.views > 0 && c.views < MIN_VIEWS_HARD));
-    const merged = [...freshWithEmbed, ...retained].slice(0, 100);
-    await setStored({ ytap_candidates: merged });
-    embedCandidatesAsync(freshWithEmbed.filter(c => !c.embedding));
-    candidates = merged;
-  } else {
-    const raw = (await getStored('ytap_candidates')) || [];
-    candidates = raw.filter(c => !(c.views > 0 && c.views < MIN_VIEWS_HARD));
-    console.log('[yt-autopilot] using stored candidates:', candidates.length, '(filtered from', raw.length, ')');
+  const { centroids, members } = clusterData || {};
+  if (!centroids || centroids.length < CLUSTER_K) {
+    if (!coldStartRetried) {
+      console.log('[yt-autopilot] v2: clusters not ready — attempting direct embed + cluster');
+      await coldStartEmbedAndCluster();
+      return pickNextNew(true);
+    }
+    console.log('[yt-autopilot] v2: clusters still not ready after cold-start embed — using lightweight fallback');
+    return pickNextColdStart();
+  }
 
-    // Trigger embedding for any stored candidates that are missing it.
-    const needsEmbed = candidates.filter(c => !c.embedding);
-    if (needsEmbed.length > 0) {
-      embedCandidatesAsync(needsEmbed);
-      // Cold start: if NOTHING is embedded yet, wait for the model to process
-      // before forming a segment — otherwise every segment is size 1.
-      if (needsEmbed.length === candidates.length) {
-        console.log('[yt-autopilot] cold start — waiting for embeddings…');
-        await new Promise(r => setTimeout(r, 4000));
-        const updated = (await getStored('ytap_candidates')) || [];
-        const byId = Object.fromEntries(updated.map(c => [c.videoId, c]));
-        candidates = candidates.map(c => ({ ...c, embedding: byId[c.videoId]?.embedding ?? null }));
-        console.log('[yt-autopilot] embeddings after wait:', candidates.filter(c => c.embedding).length, '/', candidates.length);
+  const allCandidates = storedCandidates || [];
+  const scores        = channelScores    || {};
+  const anchors       = tasteAnchors     || [];
+  const recentSet     = new Set(recentPicks.map(x => x.id));
+  const now_ms        = Date.now();
+  const watchedMap    = Object.fromEntries(
+    Object.entries(rawWatched || {}).filter(([, ts]) => now_ms - ts < WATCHED_TTL_MS)
+  );
+  const completions   = totalCompletions || 0;
+  const byId          = Object.fromEntries(allCandidates.map(c => [c.videoId, c]));
+
+  // 3. Per-cluster stats — available = members present in pool with embeddings
+  const clusterInfos = [];
+  for (let i = 0; i < centroids.length; i++) {
+    const available = (members[i] || []).map(id => byId[id]).filter(c => c && c.embedding);
+
+    // RUNT GUARD: cluster must supply at least SEGMENT_SIZE embedded candidates
+    if (available.length < SEGMENT_SIZE) continue;
+
+    // Affinity: mean(anchor_sim × anchor_weight) across available members
+    const affinity = anchors.length === 0
+      ? 0.5
+      : available.reduce((s, c) => {
+          const { sim, weight } = nearestAnchorScore(c.embedding, anchors);
+          return s + sim * weight;
+        }, 0) / available.length;
+
+    // Coherence: mean cosine of members to their cluster centroid
+    const coherence = available.reduce((s, c) => s + cosineSim(c.embedding, centroids[i]), 0) / available.length;
+
+    // Penalty for the most recently played cluster
+    const penalty = lastCluster === i ? RECENTLY_PLAYED_PENALTY : 0;
+
+    clusterInfos.push({ idx: i, available, affinity, coherence, penalty });
+  }
+
+  if (!clusterInfos.length) {
+    if (!coldStartRetried) {
+      console.log('[yt-autopilot] v2: no eligible clusters — attempting direct embed + cluster');
+      await coldStartEmbedAndCluster();
+      return pickNextNew(true);
+    }
+    console.log('[yt-autopilot] v2: still no eligible clusters after cold-start embed — using lightweight fallback');
+    return pickNextColdStart();
+  }
+
+  // Hard-quarantine clusters below COHERENCE_FLOOR from the main softmax.
+  // Discovery is exempt — it can still explore low-coherence clusters.
+  const softmaxPool  = clusterInfos.filter(ci => ci.coherence >= COHERENCE_FLOOR);
+  const quarantined  = clusterInfos.filter(ci => ci.coherence < COHERENCE_FLOOR);
+  if (quarantined.length) {
+    console.log('[yt-autopilot] v2 quarantine:',
+      quarantined.map(ci => `cluster ${ci.idx} (coherence ${ci.coherence.toFixed(3)})`).join(', '));
+  }
+  const mainPool = softmaxPool.length > 0 ? softmaxPool : clusterInfos;
+  if (softmaxPool.length === 0) {
+    console.log('[yt-autopilot] v2: all clusters below COHERENCE_FLOOR — using full pool as fallback');
+  }
+
+  // 4. Discovery: near lastCluster, under-represented in recentPicks (~DISCOVERY_RATE)
+  let chosenCluster = null;
+  if (lastCluster != null && completions >= 5 && Math.random() < DISCOVERY_RATE) {
+    const lastCentroid = centroids[lastCluster];
+    if (lastCentroid) {
+      const nearby = clusterInfos
+        .filter(ci => ci.idx !== lastCluster)
+        .map(ci => ({ ci, nearSim: cosineSim(centroids[ci.idx], lastCentroid) }))
+        .sort((a, b) => b.nearSim - a.nearSim)
+        .slice(0, 3)
+        .map(x => x.ci);
+      if (nearby.length) {
+        chosenCluster = nearby.slice().sort((a, b) =>
+          a.available.filter(c => recentSet.has(c.videoId)).length -
+          b.available.filter(c => recentSet.has(c.videoId)).length
+        )[0];
+        console.log('[yt-autopilot] v2 discovery: cluster', chosenCluster.idx, '(near cluster', lastCluster, ')');
       }
     }
   }
 
-  if (!candidates.length) {
-    console.log('[yt-autopilot] no candidates available');
-    return null;
+  // 5. Normal selection: softmax(affinity × coherence^COHERENCE_WEIGHT − penalty, TEMPERATURE)
+  if (!chosenCluster) {
+    const logits = mainPool.map(ci =>
+      (ci.affinity * Math.pow(ci.coherence, COHERENCE_WEIGHT) - ci.penalty) / TEMPERATURE
+    );
+    const maxL  = Math.max(...logits);
+    const exps  = logits.map(l => Math.exp(l - maxL));
+    const total = exps.reduce((a, b) => a + b, 0);
+    let r = Math.random() * total;
+    chosenCluster = mainPool[mainPool.length - 1];
+    for (let i = 0; i < mainPool.length; i++) {
+      r -= exps[i];
+      if (r <= 0) { chosenCluster = mainPool[i]; break; }
+    }
+    console.log(
+      '[yt-autopilot] v2 cluster', chosenCluster.idx,
+      'affinity', chosenCluster.affinity.toFixed(3),
+      'coherence', chosenCluster.coherence.toFixed(3),
+      'penalty', chosenCluster.penalty
+    );
   }
 
-  let recentPicks = await getRecentPicks();
-  let seen = new Set(recentPicks);
-  let pool = candidates.filter(c => !seen.has(c.videoId));
+  // 6. Within-cluster pick: hard-exclude recent/watched; resolve pool with starvation fallback
+  const pool     = resolveExclusionPool(chosenCluster.available, recentPicks, watchedMap);
+  const logViews = pool.map(c => Math.log10((c.views || 0) + 1));
+  const maxLog   = Math.max(...logViews);
+  const minLog   = Math.min(...logViews);
+  const logRange = maxLog - minLog || 1;
 
-  if (pool.length === 0) {
-    // All candidates seen — keep only last 5 to avoid immediate repeats
-    recentPicks = recentPicks.slice(0, 5);
-    await setStored({ recentPicks });
-    seen = new Set(recentPicks);
-    pool = candidates.filter(c => !seen.has(c.videoId));
-    console.log('[yt-autopilot] recentPicks reset — pool refreshed to', pool.length);
-  }
-
-  const finalPool = pool.length > 0 ? pool : candidates;
-
-  const scores = (await getStored('ytap_channel_scores')) || {};
-  const tasteVectors = (await getStored('ytap_taste_vectors')) || {};
-  const watchCounts = (await getStored('ytap_taste_watch_counts')) || {};
-  const lastTopic = (await getStored('ytap_last_segment_topic')) || null;
-  const newSeg = formSegment(finalPool, scores, tasteVectors, watchCounts, lastTopic);
-
-  // Save segment with index at 1 — returning index 0 now.
-  await setStored({
-    ytap_current_segment: { ...newSeg, segmentIndex: 1 },
-    ytap_last_segment_topic: newSeg.topic,
+  const scoredPool = pool.map((c, i) => {
+    const { sim, weight } = nearestAnchorScore(c.embedding, anchors);
+    const channelScore = scores[c.channel] ?? 0.5;
+    const viewPrior    = (logViews[i] - minLog) / logRange;
+    return {
+      c,
+      score: (1 - VIEW_PRIOR_WEIGHT) * (sim * weight * channelScore)
+           + VIEW_PRIOR_WEIGHT * viewPrior,
+    };
   });
 
-  const pick = newSeg.videos[0];
-  await addToRecentPicks(pick.videoId);
-  console.log('[yt-autopilot] new segment:', newSeg.topic, '— first pick:', pick.title);
-  return pick;
+  const totalScore = scoredPool.reduce((s, x) => s + Math.max(0, x.score), 0);
+  let anchor = scoredPool[0].c;
+  if (totalScore > 0) {
+    let r = Math.random() * totalScore;
+    for (const { c, score } of scoredPool) {
+      r -= Math.max(0, score);
+      if (r <= 0) { anchor = c; break; }
+    }
+  }
+
+  // 7. Fill: weighted-random from top FILL_TOP_N remaining by score.
+  // Top-N gate keeps the fill coherent (only the best-matching candidates are
+  // eligible); weighted-random within that set breaks the deterministic repeat.
+  const segment  = [anchor];
+  const usedIds  = new Set([anchor.videoId]);
+  const fillCands = scoredPool
+    .filter(x => !usedIds.has(x.c.videoId))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, FILL_TOP_N);
+
+  while (segment.length < SEGMENT_SIZE) {
+    const avail = fillCands.filter(x => !usedIds.has(x.c.videoId));
+    if (!avail.length) break;
+    const fillTotal = avail.reduce((s, x) => s + Math.max(0, x.score), 0);
+    let pick = avail[0].c;
+    if (fillTotal > 0) {
+      let r = Math.random() * fillTotal;
+      for (const { c, score } of avail) {
+        r -= Math.max(0, score);
+        if (r <= 0) { pick = c; break; }
+      }
+    }
+    segment.push(pick);
+    usedIds.add(pick.videoId);
+  }
+
+  console.log('[yt-autopilot] v2 segment cluster', chosenCluster.idx, ':', segment.map(v => v.title));
+
+  // 8. Classify cluster centroid for narration — audio only, never touches selection
+  const narration = classifyForNarration(centroids[chosenCluster.idx]);
+  console.log('[yt-autopilot] narration classification: cluster', chosenCluster.idx,
+    '→', narration.label, '(cosine', narration.score.toFixed(3) + ')');
+
+  // 9. Persist
+  await setStored({
+    ytap_current_segment: {
+      clusterIdx:     chosenCluster.idx,
+      videos:         segment,
+      segmentIndex:   1,
+      narrationLabel: narration.label,
+      narrationScore: narration.score,
+    },
+    ytap_last_cluster: chosenCluster.idx,
+  });
+  await addToRecentPicks(anchor.videoId);
+  return anchor;
+}
+
+// ─── Cold-start fallback ───────────────────────────────────────────────────────
+// Fires only when pickNextNew() can't find a usable cluster yet (e.g. a
+// brand-new install's first pick). Embeds whatever's missing directly —
+// awaited, not the usual fire-and-forget EMBED_AND_STORE — then clusters once
+// so pickNextNew() can retry with a real pool.
+
+const COLD_START_EMBED_TIMEOUT_MS = 15000;
+
+async function coldStartEmbedAndCluster() {
+  const candidates = (await getStored('ytap_candidates')) || [];
+  const unembedded = candidates.filter(c => !c.embedding);
+  if (!unembedded.length) return;
+
+  const texts = unembedded.map(c => `${c.channel}: ${c.title}`);
+  const embeddings = await embedTexts(texts, COLD_START_EMBED_TIMEOUT_MS);
+  if (!embeddings) {
+    console.log('[yt-autopilot] cold start: direct embed timed out/failed');
+    return;
+  }
+
+  const byId = Object.fromEntries(candidates.map(c => [c.videoId, c]));
+  let embedded = 0;
+  unembedded.forEach((c, i) => {
+    if (embeddings[i]) { byId[c.videoId] = { ...c, embedding: embeddings[i] }; embedded++; }
+  });
+  const merged = Object.values(byId);
+  await setStored({ ytap_candidates: merged });
+  await updateClusters(merged.filter(c => c.embedding));
+  console.log('[yt-autopilot] cold start: directly embedded', embedded, '/', unembedded.length, 'candidates');
+}
+
+// Last resort if clusters are still unusable after the embed retry —
+// weighted-random by channel score + view count only, no clustering/topics.
+async function pickNextColdStart() {
+  const [allCandidates, channelScores, recentPicks, rawWatched] = await Promise.all([
+    getStored('ytap_candidates'),
+    getStored('ytap_channel_scores'),
+    getRecentPicks(),
+    getStored('ytap_watched'),
+  ]);
+  const now_ms     = Date.now();
+  const watchedMap = Object.fromEntries(
+    Object.entries(rawWatched || {}).filter(([, ts]) => now_ms - ts < WATCHED_TTL_MS)
+  );
+  const scores = channelScores || {};
+  const pool   = resolveExclusionPool(allCandidates || [], recentPicks, watchedMap);
+
+  const logViews = pool.map(c => Math.log10((c.views || 0) + 1));
+  const maxLog   = Math.max(...logViews);
+  const minLog   = Math.min(...logViews);
+  const logRange = maxLog - minLog || 1;
+
+  const weights = pool.map((c, i) => {
+    const channelScore = scores[c.channel] ?? 0.5;
+    const viewPrior    = (logViews[i] - minLog) / logRange;
+    return 0.85 * channelScore + 0.15 * viewPrior;
+  });
+
+  const total = weights.reduce((a, b) => a + b, 0);
+  let picked = pool[pool.length - 1];
+  if (total > 0) {
+    let r = Math.random() * total;
+    for (let i = 0; i < pool.length; i++) {
+      r -= weights[i];
+      if (r <= 0) { picked = pool[i]; break; }
+    }
+  }
+
+  console.log('[yt-autopilot] cold-start fallback pick:', picked?.title);
+  await setStored({ ytap_current_segment: { videos: [picked], segmentIndex: 1 } });
+  await addToRecentPicks(picked.videoId);
+  return picked;
+}
+
+async function pickNext() {
+  return pickNextNew();
 }
 
 // ─── History helpers (Phase 3d) ───────────────────────────────────────────────
@@ -420,45 +845,95 @@ async function updateChannelScore(channel, signal) {
 
   if (signal === 1.0) {
     const current = (await getStored('ytap_current')) || {};
-    const topic = candidateTopic(current);
-    const counts = (await getStored('ytap_taste_watch_counts')) || {};
-    counts[topic] = (counts[topic] || 0) + 1;
-    await setStored({ ytap_taste_watch_counts: counts });
-    if (current.embedding) {
-      await updateTasteVector(current.embedding, topic);
-      console.log('[yt-autopilot] taste vector updated from:', current.title, 'topic:', topic, '(count:', counts[topic], ')');
+    // v2: update taste anchors and session completion count
+    if (current.embedding) await updateTasteAnchors(current.embedding);
+    // Long-term completion suppression: mark video watched so it stays out of
+    // the pick pool for WATCHED_TTL_MS (90 days) regardless of recentPicks age-out.
+    if (current.videoId) {
+      const watched = (await getStored('ytap_watched')) || {};
+      watched[current.videoId] = Date.now();
+      await setStored({ ytap_watched: watched });
     }
+    const completions = (await getStored('ytap_total_completions')) || 0;
+    await setStored({ ytap_total_completions: completions + 1 });
   }
 }
 
-function weightedPick(pool, scores, tasteVectors, watchCounts) {
-  // Log-normalize view counts across the pool so a 10M video isn't 10000x a 1K video
-  const logViews = pool.map(c => Math.log10((c.views || 0) + 1));
-  const maxLog = Math.max(...logViews);
-  const minLog = Math.min(...logViews);
-  const logRange = maxLog - minLog || 1;
-
-  const weights = pool.map((c, i) => {
-    const topic = candidateTopic(c);
-    const base = blendedWeight(scores[c.channel] ?? 0.5, c.embedding ?? null, tasteVectors, watchCounts, topic);
-    const viewScore = (logViews[i] - minLog) / logRange;
-    return 0.85 * base + 0.15 * viewScore;
-  });
-
-  const total = weights.reduce((a, b) => a + b, 0);
-  let r = Math.random() * total;
-  for (let i = 0; i < pool.length; i++) {
-    r -= weights[i];
-    if (r <= 0) return pool[i];
+// ─── Narration classification (Stage 3) ──────────────────────────────────────
+// Classifies a cluster centroid against the 12 topic centroids in topic_centroids.js
+// and returns the nearest label plus its cosine score.
+// This is the ONLY place on the v2 path that reads YTAP_TOPIC_CENTROIDS for narration.
+// It must NOT be called from selection, scoring, clustering, or anchors.
+function classifyForNarration(centroid) {
+  if (typeof YTAP_TOPIC_CENTROIDS === 'undefined' || !centroid) return { label: 'general', score: 0 };
+  let bestLabel = 'general', bestScore = -Infinity;
+  for (const [topic, topicCentroid] of Object.entries(YTAP_TOPIC_CENTROIDS)) {
+    let sim = 0;
+    for (let i = 0; i < centroid.length; i++) sim += centroid[i] * topicCentroid[i];
+    if (sim > bestScore) { bestScore = sim; bestLabel = topic; }
   }
-  return pool[pool.length - 1];
+  return { label: bestLabel, score: bestScore };
+}
+
+// Maps classifier label → mid-session genre bucket.
+// music and sports deliberately absent — their clusters are too broad; they fall through
+// to continuation_generic. commentary and general likewise have no dedicated cont_ bucket.
+const CONT_BUCKET_MAP = {
+  gaming:  'cont_gaming',
+  tech:    'cont_tech',
+  finance: 'cont_finance',
+  science: 'cont_science',
+  history: 'cont_history',
+  comedy:  'cont_comedy',
+  food:    'cont_food',
+  film_tv: 'cont_filmtv',
+};
+
+// Segments with no narrationLabel (the cold-start fallback's segment shape,
+// or any bucket with no files yet) fall through to continuation_generic.
+function resolveContinuationBucket(seg) {
+  if (!seg || seg.narrationLabel === undefined) return 'continuation_generic';
+  if (seg.narrationScore >= NARRATION_CONFIDENCE_THRESHOLD) {
+    const bucket = CONT_BUCKET_MAP[seg.narrationLabel];
+    if (bucket && YTAP_NARRATION[bucket]?.length) return bucket;
+  }
+  return 'continuation_generic';
 }
 
 // ─── Narration (Phase 5e) ─────────────────────────────────────────────────────
+// _narrationRecency and _lastNarrationTs are mirrored to chrome.storage.local
+// (ytap_narration_recency / ytap_narration_last_ts). Every segment boundary
+// navigates via window.location.href — a hard navigation that fully re-injects
+// the content script and resets plain module state — so without persisting
+// these, anti-repetition and the cooldown are inert on every segment, not just
+// across a manual extension reload.
 
-let _lastNarrationClip  = null;
+const _narrationRecency    = new Map(); // bucket → Set of recently played filenames (FIFO, size ≤ ceil(bucketSize/2))
+let _lastNarrationTs       = 0;         // timestamp of the most recently started narration clip
 let _currentNarrationAudio = null;
 let _narrationResolve  = null;
+let _narrationStateReady   = null;
+
+function loadNarrationState() {
+  if (!_narrationStateReady) {
+    _narrationStateReady = Promise.all([
+      getStored('ytap_narration_recency'),
+      getStored('ytap_narration_last_ts'),
+    ]).then(([storedRecency, storedTs]) => {
+      for (const [bucket, filenames] of Object.entries(storedRecency || {})) {
+        _narrationRecency.set(bucket, new Set(filenames));
+      }
+      _lastNarrationTs = storedTs || 0;
+    });
+  }
+  return _narrationStateReady;
+}
+
+function saveNarrationState() {
+  const recencyObj = {};
+  for (const [bucket, set] of _narrationRecency.entries()) recencyObj[bucket] = [...set];
+  return setStored({ ytap_narration_recency: recencyObj, ytap_narration_last_ts: _lastNarrationTs });
+}
 
 function stopNarration() {
   if (_currentNarrationAudio) {
@@ -471,18 +946,37 @@ function stopNarration() {
   }
 }
 
-async function playNarration(topic) {
+async function playNarration(bucket) {
   if (typeof YTAP_NARRATION === 'undefined') return;
-  const clips = YTAP_NARRATION[topic] || YTAP_NARRATION['general'];
+  const clips = YTAP_NARRATION[bucket];
   if (!clips?.length) return;
 
-  const pool = clips.length > 1 ? clips.filter(c => c !== _lastNarrationClip) : clips;
-  const clip = pool[Math.floor(Math.random() * pool.length)];
-  _lastNarrationClip = clip;
+  await loadNarrationState();
 
-  const audio = new Audio(chrome.runtime.getURL(`audio/${topic}/${clip}`));
+  const now = Date.now();
+  if (now - _lastNarrationTs < NARRATION_COOLDOWN_MS) {
+    const remaining = Math.round((NARRATION_COOLDOWN_MS - (now - _lastNarrationTs)) / 1000);
+    console.log(`[yt-autopilot] narration suppressed — cooldown ${remaining}s remaining`);
+    return;
+  }
+  _lastNarrationTs = now;
+
+  const recency   = _narrationRecency.get(bucket) || new Set();
+  const exclude   = Math.ceil(clips.length / 2);
+  const available = clips.length > 1 ? clips.filter(c => !recency.has(c)) : clips;
+  const pool      = available.length > 0 ? available : clips; // full-reset if all excluded
+  const clip      = pool[Math.floor(Math.random() * pool.length)];
+
+  recency.add(clip);
+  if (recency.size > exclude) recency.delete(recency.values().next().value); // evict oldest
+  _narrationRecency.set(bucket, recency);
+  await saveNarrationState();
+
+  const audio = new Audio(chrome.runtime.getURL(`audio/${bucket}/${clip}`));
   _currentNarrationAudio = audio;
-  console.log('[yt-autopilot] narration:', topic, clip);
+  connectNarrationToAnalyser(audio);     // wire into DJ splash analyser if active
+  connectNarrationToNarrAnalyser(audio); // wire into segment narration analyser if active
+  console.log('[yt-autopilot] narration:', bucket, clip);
 
   await new Promise(resolve => {
     _narrationResolve = resolve;
@@ -498,6 +992,277 @@ async function playNarration(topic) {
       resolve();
     });
   });
+}
+
+// ─── DJ circle UI ────────────────────────────────────────────────────────────
+
+let _djSplashAnimId = null;
+let _djAudioCtx     = null;
+let _djAnalyser     = null;
+let _djFreqData     = null;
+
+// Called from playNarration() — connects the live Audio element into the
+// analyser so the blob ring reacts to the actual audio waveform.
+function connectNarrationToAnalyser(audioEl) {
+  if (!_djAnalyser || !_djAudioCtx) return;
+  try {
+    if (_djAudioCtx.state === 'suspended') _djAudioCtx.resume();
+    const src = _djAudioCtx.createMediaElementSource(audioEl);
+    src.connect(_djAnalyser);
+  } catch (e) {
+    console.log('[yt-autopilot] analyser connect failed:', e.message);
+  }
+}
+
+function showDJSplash() {
+  if (document.getElementById('ytap-dj-splash')) return;
+
+  // Set up Web Audio analyser — failure is non-fatal, blob still runs on harmonics
+  try {
+    _djAudioCtx = new AudioContext();
+    _djAnalyser = _djAudioCtx.createAnalyser();
+    _djAnalyser.fftSize = 256;               // 128 frequency bins
+    _djAnalyser.smoothingTimeConstant = 0.82; // temporal smoothing built-in
+    _djAnalyser.connect(_djAudioCtx.destination);
+    _djFreqData = new Uint8Array(_djAnalyser.frequencyBinCount); // 128 values, 0–255
+  } catch (e) {
+    console.log('[yt-autopilot] AudioContext init failed:', e.message);
+  }
+
+  const card = document.createElement('div');
+  card.id = 'ytap-dj-splash';
+  document.body.appendChild(card);
+
+  // ── Blob ring constants ──────────────────────────────────────────────────
+  const SIZE      = 140;
+  const CX        = SIZE / 2, CY = SIZE / 2;
+  const R         = 48;          // base radius (px)
+  const N         = 120;         // sample points around the perimeter
+  const AMP_BASE  = R * 0.08;   // harmonic perturbation max (~3.8px)
+  const AMP_AUDIO = R * 0.22;   // audio-driven perturbation max (~10.6px)
+  const BINS_USED = 64;          // use the lower 64 bins (covers 0–5.5kHz, speech range)
+
+  // Slow organic harmonics — keep the ring alive even during silence
+  const H = [
+    { k: 2, w: 0.40, phase: 0.00, speed:  0.90 },
+    { k: 3, w: 0.30, phase: 1.20, speed: -0.60 },
+    { k: 4, w: 0.20, phase: 2.50, speed:  0.40 },
+    { k: 5, w: 0.10, phase: 4.00, speed: -0.70 },
+  ];
+  const totalW = H.reduce((s, h) => s + h.w, 0);
+  H.forEach(h => { h.a = (h.w / totalW) * AMP_BASE; });
+
+  const NS  = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('width',    SIZE);
+  svg.setAttribute('height',   SIZE);
+  svg.setAttribute('viewBox',  `0 0 ${SIZE} ${SIZE}`);
+  svg.setAttribute('overflow', 'visible'); // let glow bleed outside SVG bounds
+
+  const blob = document.createElementNS(NS, 'path');
+  blob.setAttribute('fill',            'none');
+  blob.setAttribute('stroke',          '#a8c7fa');
+  blob.setAttribute('stroke-width',    '4.0');
+  blob.setAttribute('stroke-linecap',  'round');
+  blob.setAttribute('stroke-linejoin', 'round');
+  svg.appendChild(blob);
+  card.appendChild(svg);
+
+  // Per-point smoothed audio value — EMA to prevent jitter between frames
+  const smooth = new Float32Array(N);
+
+  function frame(ts) {
+    const t = ts * 0.001;
+
+    // Pull latest frequency data
+    let hasAudio = false;
+    if (_djAnalyser && _djFreqData) {
+      _djAnalyser.getByteFrequencyData(_djFreqData);
+      let sum = 0;
+      for (let i = 0; i < BINS_USED; i++) sum += _djFreqData[i];
+      hasAudio = sum > 80; // ignore near-silence
+    }
+
+    const pts = new Array(N);
+    for (let i = 0; i < N; i++) {
+      const theta = (2 * Math.PI * i) / N;
+      let r = R;
+
+      // Slow harmonic deformation (always active)
+      for (const h of H) r += h.a * Math.sin(h.k * theta + h.phase + h.speed * t);
+
+      // Audio-reactive layer: map each point to a linearly interpolated freq bin
+      if (hasAudio) {
+        const binF   = (i / N) * BINS_USED;
+        const b0     = Math.floor(binF);
+        const b1     = Math.min(b0 + 1, BINS_USED - 1);
+        const raw    = (_djFreqData[b0] * (1 - (binF - b0)) + _djFreqData[b1] * (binF - b0)) / 255;
+        smooth[i]    = smooth[i] * 0.55 + raw * 0.45; // per-point EMA
+        r           += smooth[i] * AMP_AUDIO;
+      } else {
+        smooth[i] *= 0.85; // decay toward zero on silence
+        r         += smooth[i] * AMP_AUDIO;
+      }
+
+      pts[i] = [CX + r * Math.cos(theta), CY + r * Math.sin(theta)];
+    }
+
+    // Smooth closed path: Q bezier through midpoints, original points as controls
+    const sx = (pts[N-1][0] + pts[0][0]) * 0.5;
+    const sy = (pts[N-1][1] + pts[0][1]) * 0.5;
+    let d = `M${sx.toFixed(2)} ${sy.toFixed(2)}`;
+    for (let i = 0; i < N; i++) {
+      const p  = pts[i];
+      const nx = (pts[i][0] + pts[(i + 1) % N][0]) * 0.5;
+      const ny = (pts[i][1] + pts[(i + 1) % N][1]) * 0.5;
+      d += ` Q${p[0].toFixed(2)} ${p[1].toFixed(2)} ${nx.toFixed(2)} ${ny.toFixed(2)}`;
+    }
+    blob.setAttribute('d', d + 'Z');
+    _djSplashAnimId = requestAnimationFrame(frame);
+  }
+
+  _djSplashAnimId = requestAnimationFrame(frame);
+}
+
+function hideDJSplash() {
+  if (_djSplashAnimId) { cancelAnimationFrame(_djSplashAnimId); _djSplashAnimId = null; }
+  if (_djAudioCtx)    { _djAudioCtx.close().catch(() => {}); _djAudioCtx = null; _djAnalyser = null; _djFreqData = null; }
+  const el = document.getElementById('ytap-dj-splash');
+  if (!el) return;
+  el.style.opacity = '0';
+  setTimeout(() => el.remove(), 420);
+}
+
+let _narrAnimId   = null;
+let _narrAudioCtx = null;
+let _narrAnalyser = null;
+let _narrFreqData = null;
+
+function connectNarrationToNarrAnalyser(audioEl) {
+  if (!_narrAnalyser || !_narrAudioCtx) return;
+  try {
+    if (_narrAudioCtx.state === 'suspended') _narrAudioCtx.resume();
+    const src = _narrAudioCtx.createMediaElementSource(audioEl);
+    src.connect(_narrAnalyser);
+  } catch (e) {
+    console.log('[yt-autopilot] narr analyser connect failed:', e.message);
+  }
+}
+
+function startNarrBlobRing(container) {
+  const SIZE = 110, CX = 55, CY = 55, R = 38, N = 120;
+  const AMP_BASE  = R * 0.08;
+  const AMP_AUDIO = R * 0.22;
+  const BINS_USED = 64;
+
+  const H = [
+    { k: 2, w: 0.40, phase: 0.50, speed:  0.90 },
+    { k: 3, w: 0.30, phase: 1.70, speed: -0.60 },
+    { k: 4, w: 0.20, phase: 3.00, speed:  0.40 },
+    { k: 5, w: 0.10, phase: 4.50, speed: -0.70 },
+  ];
+  const totalW = H.reduce((s, h) => s + h.w, 0);
+  H.forEach(h => { h.a = (h.w / totalW) * AMP_BASE; });
+
+  const NS  = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('width',    SIZE);
+  svg.setAttribute('height',   SIZE);
+  svg.setAttribute('viewBox',  `0 0 ${SIZE} ${SIZE}`);
+  svg.setAttribute('overflow', 'visible');
+
+  const blob = document.createElementNS(NS, 'path');
+  blob.setAttribute('fill',            'none');
+  blob.setAttribute('stroke',          '#a8c7fa');
+  blob.setAttribute('stroke-width',    '4.0');
+  blob.setAttribute('stroke-linecap',  'round');
+  blob.setAttribute('stroke-linejoin', 'round');
+  svg.appendChild(blob);
+  container.appendChild(svg);
+
+  const smooth = new Float32Array(N);
+
+  function frame(ts) {
+    const t = ts * 0.001;
+
+    let hasAudio = false;
+    if (_narrAnalyser && _narrFreqData) {
+      _narrAnalyser.getByteFrequencyData(_narrFreqData);
+      let sum = 0;
+      for (let i = 0; i < BINS_USED; i++) sum += _narrFreqData[i];
+      hasAudio = sum > 80;
+    }
+
+    const pts = new Array(N);
+    for (let i = 0; i < N; i++) {
+      const theta = (2 * Math.PI * i) / N;
+      let r = R;
+      for (const h of H) r += h.a * Math.sin(h.k * theta + h.phase + h.speed * t);
+      if (hasAudio) {
+        const binF = (i / N) * BINS_USED;
+        const b0   = Math.floor(binF);
+        const b1   = Math.min(b0 + 1, BINS_USED - 1);
+        const raw  = (_narrFreqData[b0] * (1 - (binF - b0)) + _narrFreqData[b1] * (binF - b0)) / 255;
+        smooth[i]  = smooth[i] * 0.55 + raw * 0.45;
+        r         += smooth[i] * AMP_AUDIO;
+      } else {
+        smooth[i] *= 0.85;
+        r         += smooth[i] * AMP_AUDIO;
+      }
+      pts[i] = [CX + r * Math.cos(theta), CY + r * Math.sin(theta)];
+    }
+
+    const sx = (pts[N-1][0] + pts[0][0]) * 0.5;
+    const sy = (pts[N-1][1] + pts[0][1]) * 0.5;
+    let d = `M${sx.toFixed(2)} ${sy.toFixed(2)}`;
+    for (let i = 0; i < N; i++) {
+      const p  = pts[i];
+      const nx = (pts[i][0] + pts[(i + 1) % N][0]) * 0.5;
+      const ny = (pts[i][1] + pts[(i + 1) % N][1]) * 0.5;
+      d += ` Q${p[0].toFixed(2)} ${p[1].toFixed(2)} ${nx.toFixed(2)} ${ny.toFixed(2)}`;
+    }
+    blob.setAttribute('d', d + 'Z');
+    _narrAnimId = requestAnimationFrame(frame);
+  }
+
+  _narrAnimId = requestAnimationFrame(frame);
+}
+
+function stopNarrBlobRing() {
+  if (_narrAnimId) { cancelAnimationFrame(_narrAnimId); _narrAnimId = null; }
+}
+
+function setNarrating(active) {
+  if (active) {
+    // Setup audio analyser
+    try {
+      _narrAudioCtx = new AudioContext();
+      _narrAnalyser = _narrAudioCtx.createAnalyser();
+      _narrAnalyser.fftSize = 256;
+      _narrAnalyser.smoothingTimeConstant = 0.82;
+      _narrAnalyser.connect(_narrAudioCtx.destination);
+      _narrFreqData = new Uint8Array(_narrAnalyser.frequencyBinCount);
+    } catch (e) {
+      console.log('[yt-autopilot] narr AudioContext failed:', e.message);
+    }
+
+    // Prepend section inside the overlay so they share the same box
+    const overlayEl = document.getElementById('ytap-overlay');
+    if (!overlayEl) return;
+    const section = document.createElement('div');
+    section.id = 'ytap-narr-section';
+    overlayEl.prepend(section);
+    requestAnimationFrame(() => section.classList.add('active'));
+    startNarrBlobRing(section);
+  } else {
+    stopNarrBlobRing();
+    const section = document.getElementById('ytap-narr-section');
+    if (section) {
+      section.classList.remove('active');
+      setTimeout(() => section.remove(), 320);
+    }
+    if (_narrAudioCtx) { _narrAudioCtx.close().catch(() => {}); _narrAudioCtx = null; _narrAnalyser = null; _narrFreqData = null; }
+  }
 }
 
 // ─── Overlay (Phase 3b/3c/3d) ────────────────────────────────────────────────
@@ -520,12 +1285,8 @@ async function injectOverlay(video) {
 
   const overlay = document.createElement('div');
   overlay.id = 'ytap-overlay';
-  if (!video.paused) overlay.classList.add('playing');
   overlay.innerHTML = `
     <div class="ytap-top">
-      <div class="ytap-visualizer">
-        <span></span><span></span><span></span><span></span><span></span>
-      </div>
       <div class="ytap-meta">
         <div class="ytap-channel">${escapeHtml(current.channel || '')}</div>
         <div class="ytap-title">${escapeHtml(current.title || '')}</div>
@@ -533,22 +1294,13 @@ async function injectOverlay(video) {
     </div>
     <div class="ytap-controls">
       <button id="ytap-back" ${hasHistory ? '' : 'disabled'}>&#9664; Back</button>
-      <button id="ytap-pause">${video.paused ? '&#9654; Play' : '&#10074;&#10074; Pause'}</button>
       <button id="ytap-skip">Skip &#9654;&#9654;</button>
     </div>
   `;
 
   document.body.appendChild(overlay);
 
-  const pauseBtn = overlay.querySelector('#ytap-pause');
-  const backBtn  = overlay.querySelector('#ytap-back');
-
-  pauseBtn.addEventListener('click', () => {
-    video.paused ? video.play() : video.pause();
-  });
-
-  video.addEventListener('pause', () => { pauseBtn.innerHTML = '&#9654; Play';           overlay.classList.remove('playing'); });
-  video.addEventListener('play',  () => { pauseBtn.innerHTML = '&#10074;&#10074; Pause'; overlay.classList.add('playing'); });
+  const backBtn = overlay.querySelector('#ytap-back');
 
   backBtn.addEventListener('click', async () => {
     const prev = await popFromHistory();
@@ -580,11 +1332,10 @@ async function injectOverlay(video) {
     const pick = await pickNext();
     if (pick) {
       if (isSegmentBoundary) {
-        const newSeg = await getStored('ytap_current_segment');
-        const topic = newSeg?.topic || 'general';
-        console.log('[yt-autopilot] skip crossed segment boundary → narration:', topic);
         video.pause();
-        await playNarration(topic);
+        setNarrating(true);
+        await playNarration('skip_ack');
+        setNarrating(false);
       }
       await setStored({ ytap_current: pick });
       window.location.href = `https://www.youtube.com/watch?v=${pick.videoId}`;
@@ -625,6 +1376,22 @@ function waitForVideo(timeoutMs = 8000) {
       }
     }, 150);
   });
+}
+
+// waitForVideo() alone gave up permanently on a single 8s miss, stranding the
+// session with no overlay and no 'ended' listener since nothing else re-triggers
+// initAutoplay() on the same URL. Retry a few times first; if still nothing,
+// fall back to whatever <video> exists even if it never hit readyState >= 1 —
+// enough to hand the user a Skip button instead of a dead tab.
+async function waitForVideoWithRetries(maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const video = await waitForVideo();
+    if (video) return video;
+    console.log(`[yt-autopilot] waitForVideo attempt ${attempt}/${maxAttempts} failed, retrying`);
+  }
+  const fallback = document.querySelector('video');
+  if (fallback) console.log('[yt-autopilot] waitForVideo: using unready video element as last resort');
+  return fallback;
 }
 
 let autoplayActive = false;
@@ -674,9 +1441,8 @@ async function onVideoEnded() {
   const pick = await pickNext();
   if (pick) {
     if (isSegmentBoundary) {
-      const newSeg = await getStored('ytap_current_segment');
-      const topic  = newSeg?.topic || 'general';
-      console.log('[yt-autopilot] segment boundary → new topic:', topic);
+      const newSeg     = await getStored('ytap_current_segment');
+      const narrBucket = resolveContinuationBucket(newSeg);
 
       // Suppress YouTube's SPA autoplay navigation while narration plays so it
       // can't cut off the audio with its own end-screen countdown.
@@ -685,7 +1451,9 @@ async function onVideoEnded() {
       const blockNav = (e) => e.stopImmediatePropagation();
       document.addEventListener('yt-navigate-start', blockNav, { capture: true });
 
-      await playNarration(topic);
+      setNarrating(true);
+      await playNarration(narrBucket);
+      setNarrating(false);
 
       history.pushState = origPushState;
       document.removeEventListener('yt-navigate-start', blockNav, { capture: true });
@@ -715,8 +1483,9 @@ async function initAutoplay() {
   autoplayActive = true;
   autoplayInitUrl = url;
 
-  const video = await waitForVideo();
+  const video = await waitForVideoWithRetries();
   if (!video) {
+    console.log('[yt-autopilot] initAutoplay: no video element found after retries — giving up on', url);
     autoplayActive = false;
     autoplayInitUrl = '';
     return;
@@ -742,9 +1511,59 @@ async function initAutoplay() {
     const retained = prev.filter(c => !newIds.has(c.videoId) && !(c.views > 0 && c.views < MIN_VIEWS_HARD));
     const merged = [...withEmbed, ...retained].slice(0, 100);
     await setStored({ ytap_candidates: merged });
+    await updateClusters(merged.filter(c => c.embedding));
     embedCandidatesAsync(withEmbed.filter(c => !c.embedding));
     console.log('[yt-autopilot] sidebar scrape:', fresh.length, 'fresh, pool now', merged.length);
   }, 45000);
+}
+
+// ─── DJ start ─────────────────────────────────────────────────────────────────
+// Shared by the PICK_NEXT message and checkPendingStart(). Both callers set
+// running: true themselves before calling this — pickNext() can take 15s+ on
+// a cold start, and the popup is long closed by the time it resolves.
+
+async function runDjStartPick() {
+  showDJSplash();
+  try {
+    const pick = await pickNext();
+    if (pick) {
+      await playNarration('cold_open');
+      hideDJSplash();
+      await setStored({ ytap_current: pick });
+      console.log('[yt-autopilot] navigating to first pick:', pick.videoId);
+      window.location.href = `https://www.youtube.com/watch?v=${pick.videoId}`;
+    } else {
+      hideDJSplash();
+      await setStored({ running: false });
+      await chrome.storage.local.remove('djTabId');
+    }
+    return pick;
+  } catch (err) {
+    console.error('[yt-autopilot] DJ start pick error:', err);
+    hideDJSplash();
+    await setStored({ running: false });
+    await chrome.storage.local.remove('djTabId');
+    return null;
+  }
+}
+
+// Resumes a start the popup couldn't deliver directly (non-YouTube tab, or a
+// stale content script) — popup.js sets djTabId + ytap_pending_start and
+// navigates/reloads the tab; this runs once that re-injects content.js.
+async function checkPendingStart() {
+  const pending = await getStored('ytap_pending_start');
+  if (!pending) return;
+  await setStored({ ytap_pending_start: false });
+
+  const [djTabId, myTabId] = await Promise.all([getStored('djTabId'), getMyTabId()]);
+  if (djTabId !== myTabId) {
+    console.log('[yt-autopilot] pending start flag set but this is not the DJ tab — ignoring');
+    return;
+  }
+
+  console.log('[yt-autopilot] resuming pending DJ start');
+  await setStored({ running: true });
+  await runDjStartPick();
 }
 
 // ─── Message listener ─────────────────────────────────────────────────────────
@@ -752,22 +1571,14 @@ async function initAutoplay() {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'PICK_NEXT') {
     console.log('[yt-autopilot] PICK_NEXT received');
-    pickNext().then(async pick => {
-      try { sendResponse({ pick }); } catch (_) {}
-      if (pick) {
-        await playNarration('intro');
-        await new Promise(r => setTimeout(r, 1000));
-        const firstSeg = await getStored('ytap_current_segment');
-        if (firstSeg?.topic) await playNarration(firstSeg.topic);
-        await setStored({ ytap_current: pick });
-        console.log('[yt-autopilot] navigating to first pick:', pick.videoId);
-        window.location.href = `https://www.youtube.com/watch?v=${pick.videoId}`;
-      }
-    }).catch(err => {
-      console.error('[yt-autopilot] PICK_NEXT error:', err);
-      try { sendResponse({ pick: null }); } catch (_) {}
-    });
-    return true; // keep channel open for async response
+    // Ack immediately — the popup just needs delivery confirmed, then closes.
+    try { sendResponse({ ok: true }); } catch (_) {}
+    (async () => {
+      const myTabId = await getMyTabId();
+      await setStored({ running: true, djTabId: myTabId });
+      await runDjStartPick();
+    })();
+    return;
   }
 });
 
@@ -787,6 +1598,7 @@ function scrapeAndEmbedIfFeed() {
     const retained = prev.filter(c => !newIds.has(c.videoId) && !(c.views > 0 && c.views < MIN_VIEWS_HARD));
     const merged = [...freshWithEmbed, ...retained].slice(0, 100);
     await setStored({ ytap_candidates: merged });
+    await updateClusters(merged.filter(c => c.embedding));
     embedCandidatesAsync(freshWithEmbed.filter(c => !c.embedding));
     console.log('[yt-autopilot] feed scrape:', candidates.length, 'fresh +', retained.length, 'retained =', merged.length, 'total');
   }, 1500);
@@ -794,16 +1606,18 @@ function scrapeAndEmbedIfFeed() {
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
-function warmNarrationIntro() {
+function warmNarrationColdOpen() {
   if (typeof YTAP_NARRATION === 'undefined') return;
-  for (const clip of (YTAP_NARRATION['intro'] || [])) {
-    const a = new Audio(chrome.runtime.getURL(`audio/intro/${clip}`));
+  for (const clip of (YTAP_NARRATION['cold_open'] || [])) {
+    const a = new Audio(chrome.runtime.getURL(`audio/cold_open/${clip}`));
     a.load();
   }
 }
 
-warmNarrationIntro();
+warmNarrationColdOpen();
+loadNarrationState(); // pre-hydrate recency/cooldown from storage so the first playNarration() call doesn't wait on it
 scrapeAndEmbedIfFeed();
+checkPendingStart();
 initAutoplay();
 
 // Re-init after YouTube SPA navigation — only when the URL actually changed

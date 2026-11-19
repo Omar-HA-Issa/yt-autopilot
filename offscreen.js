@@ -46,7 +46,7 @@ port.onMessage.addListener(async (msg) => {
       const model = await getEmbedder();
       const embeddings = new Map();
       for (const c of msg.candidates) {
-        const out = await model(c.title, { pooling: 'mean', normalize: true });
+        const out = await model(`${c.channel}: ${c.title}`, { pooling: 'mean', normalize: true });
         embeddings.set(c.videoId, Array.from(out.data));
       }
       port.postMessage({

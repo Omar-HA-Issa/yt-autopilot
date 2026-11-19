@@ -22,6 +22,7 @@ const VOICE_SETTINGS = {
   similarity_boost:  0.80,
   style:             0.35,
   use_speaker_boost: true,
+  speed:             0.9, // eleven_multilingual_v2 default is 1.0 (range 0.7-1.2); slowed down, was reading too fast
 };
 
 function collectTxtFiles(dir) {

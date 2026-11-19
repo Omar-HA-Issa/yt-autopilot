@@ -4,60 +4,121 @@
   <meta charset="UTF-8">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html { background: #0f0f0f; }
+
     body {
-      width: 220px;
+      width: 260px;
       background: #0f0f0f;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      padding: 20px 16px;
-    }
-    .logo {
+      font-family: "YouTube Sans", Roboto, Arial, sans-serif;
       color: #fff;
-      font-size: 13px;
-      font-weight: 600;
-      letter-spacing: 0.5px;
-      margin-bottom: 16px;
+      padding: 20px;
+      user-select: none;
+    }
+
+    /* ── Header ── */
+    .header {
       display: flex;
       align-items: center;
-      gap: 8px;
+      justify-content: space-between;
+      margin-bottom: 24px;
     }
-    .logo-dot {
-      width: 8px;
-      height: 8px;
+
+    .app-name {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.10em;
+      text-transform: uppercase;
+      color: #fff;
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
       border-radius: 50%;
-      background: #ff0000;
+      background: #2a2a2a;
+      transition: background 0.3s ease, box-shadow 0.3s ease;
     }
+
+    .status-dot.active {
+      background: #a8c7fa;
+      box-shadow: 0 0 8px rgba(168, 199, 250, 0.75);
+    }
+
+    /* ── Primary button ── */
     #toggleBtn {
       width: 100%;
-      padding: 12px;
+      padding: 13px;
       border: none;
-      border-radius: 8px;
-      font-size: 14px;
-      font-weight: 600;
+      border-radius: 16px;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
       cursor: pointer;
-      letter-spacing: 0.3px;
+      transition: opacity 0.15s ease;
     }
+
     #toggleBtn:hover { opacity: 0.85; }
-    #toggleBtn.start { background: #ff0000; color: #fff; }
-    #toggleBtn.stop  { background: #272727; color: #aaa; }
-    #resetBtn {
-      display: block;
-      text-align: center;
-      margin-top: 12px;
-      font-size: 11px;
-      color: #444;
-      cursor: pointer;
-      text-decoration: none;
+
+    #toggleBtn.start {
+      background: #a8c7fa;
+      color: #0d1117;
     }
-    #resetBtn:hover { color: #888; }
+
+    #toggleBtn.stop {
+      background: rgba(255, 255, 255, 0.07);
+      color: #666;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+    }
+
+    /* ── Footer ── */
+    .footer {
+      margin-top: 14px;
+      text-align: center;
+    }
+
+    #resetBtn {
+      width: 100%;
+      padding: 13px;
+      border: none;
+      border-radius: 16px;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+      background: #a8c7fa;
+      color: #0d1117;
+      transition: opacity 0.15s ease;
+    }
+
+    #resetBtn:hover { opacity: 0.85; }
+
+    /* ── Pool warning ── */
+    #poolWarning {
+      display: none;
+      font-size: 11px;
+      color: #f5a623;
+      line-height: 1.45;
+      margin-bottom: 12px;
+    }
   </style>
 </head>
 <body>
-  <div class="logo">
-    <div class="logo-dot"></div>
-    YouTube Autopilot
+
+  <div class="header">
+    <span class="app-name">YouTube Autopilot</span>
+    <div class="status-dot" id="statusDot"></div>
   </div>
+
+  <div id="poolWarning"></div>
   <button id="toggleBtn" class="start">Start DJ</button>
-  <a id="resetBtn">Reset taste profile</a>
+
+  <div class="footer">
+    <button id="resetBtn">Reset taste profile</button>
+  </div>
+
   <script src="popup.js"></script>
 </body>
 </html>

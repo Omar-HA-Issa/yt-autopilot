@@ -79,9 +79,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  chrome.storage.local.set({ running: false, djTabId: null });
+  chrome.storage.local.set({ running: false, djTabId: null, ytap_pending_start: false });
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.local.set({ running: false, djTabId: null });
+  chrome.storage.local.set({ running: false, djTabId: null, ytap_pending_start: false });
 });
