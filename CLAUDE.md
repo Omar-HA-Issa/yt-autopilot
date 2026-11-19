@@ -283,7 +283,7 @@ range `0.7–1.2`) — tuned down because the voice was reading too fast at defa
   - `ytap_clusters` / `ytap_taste_anchors` / `ytap_watched` — persist indefinitely
   - `ytap_narration_recency` / `ytap_narration_last_ts` — persist indefinitely,
     mirror in-memory narration state across hard navigations
-  - `running` + `djTabId` — reset on browser startup via `onStartup`
+  - `running` + `djTabId` + `ytap_pending_start` — reset on browser startup via `onStartup`
 
 ---
 
@@ -342,6 +342,7 @@ yt-autopilot/
 |-----|-------------|
 | `running` | boolean — is the DJ active |
 | `djTabId` | tab ID that owns the current session |
+| `ytap_pending_start` | boolean — set by popup.js when it couldn't deliver `PICK_NEXT` directly (active tab wasn't YouTube, or its content script wasn't injected yet); `content.js` checks and clears it on every load, and starts the DJ itself if `djTabId` matches this tab |
 | `recentPicks` | `{id, ts}[]` max 100, persists across sessions, 30-day age-out |
 | `ytap_candidates` | `{title, channel, videoId, views, embedding?}[]` max 100 |
 | `ytap_current` | current video object being played |

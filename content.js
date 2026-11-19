@@ -1523,28 +1523,68 @@ async function initAutoplay() {
   }, 45000);
 }
 
+// ─── DJ start ─────────────────────────────────────────────────────────────────
+// Shared by the PICK_NEXT message (normal start, content script already live)
+// and checkPendingStart() (start was deferred across a navigation/reload
+// because the content script wasn't injected yet when the popup tried).
+
+// onPickResolved (if given) fires the instant the pick itself is known — i.e.
+// before narration/navigation. PICK_NEXT's sendResponse must happen there, not
+// after this function returns: window.location.href below tears down this
+// context, which can drop a response sent only after navigation starts and
+// make a real success look like a dead message channel to the caller.
+async function runDjStartPick(onPickResolved) {
+  showDJSplash();
+  try {
+    const pick = await pickNext();
+    onPickResolved?.(pick);
+    if (pick) {
+      await playNarration('cold_open');
+      hideDJSplash();
+      await setStored({ ytap_current: pick });
+      console.log('[yt-autopilot] navigating to first pick:', pick.videoId);
+      window.location.href = `https://www.youtube.com/watch?v=${pick.videoId}`;
+    } else {
+      hideDJSplash();
+    }
+    return pick;
+  } catch (err) {
+    console.error('[yt-autopilot] DJ start pick error:', err);
+    hideDJSplash();
+    onPickResolved?.(null);
+    return null;
+  }
+}
+
+// Picks up a start that the popup couldn't deliver directly — either the
+// active tab wasn't on YouTube (navigated here first) or it was on YouTube
+// but predated this content script's injection (e.g. extension reloaded
+// while the tab was already open). The popup sets djTabId + ytap_pending_start
+// and either navigates or reloads the tab; this runs once the resulting page
+// load re-injects content.js. Cleared unconditionally on read so a stale flag
+// never re-fires on a later unrelated load.
+async function checkPendingStart() {
+  const pending = await getStored('ytap_pending_start');
+  if (!pending) return;
+  await setStored({ ytap_pending_start: false });
+
+  const [djTabId, myTabId] = await Promise.all([getStored('djTabId'), getMyTabId()]);
+  if (djTabId !== myTabId) {
+    console.log('[yt-autopilot] pending start flag set but this is not the DJ tab — ignoring');
+    return;
+  }
+
+  console.log('[yt-autopilot] resuming pending DJ start');
+  await setStored({ running: true });
+  await runDjStartPick();
+}
+
 // ─── Message listener ─────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'PICK_NEXT') {
     console.log('[yt-autopilot] PICK_NEXT received');
-    showDJSplash();
-    pickNext().then(async pick => {
-      try { sendResponse({ pick }); } catch (_) {}
-      if (pick) {
-        await playNarration('cold_open');
-        hideDJSplash();
-        await setStored({ ytap_current: pick });
-        console.log('[yt-autopilot] navigating to first pick:', pick.videoId);
-        window.location.href = `https://www.youtube.com/watch?v=${pick.videoId}`;
-      } else {
-        hideDJSplash();
-      }
-    }).catch(err => {
-      console.error('[yt-autopilot] PICK_NEXT error:', err);
-      hideDJSplash();
-      try { sendResponse({ pick: null }); } catch (_) {}
-    });
+    runDjStartPick(pick => { try { sendResponse({ pick }); } catch (_) {} });
     return true; // keep channel open for async response
   }
 });
@@ -1584,6 +1624,7 @@ function warmNarrationColdOpen() {
 warmNarrationColdOpen();
 loadNarrationState(); // pre-hydrate recency/cooldown from storage so the first playNarration() call doesn't wait on it
 scrapeAndEmbedIfFeed();
+checkPendingStart();
 initAutoplay();
 
 // Re-init after YouTube SPA navigation — only when the URL actually changed
