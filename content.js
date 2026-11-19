@@ -1534,11 +1534,15 @@ async function runDjStartPick() {
       window.location.href = `https://www.youtube.com/watch?v=${pick.videoId}`;
     } else {
       hideDJSplash();
+      await setStored({ running: false });
+      await chrome.storage.local.remove('djTabId');
     }
     return pick;
   } catch (err) {
     console.error('[yt-autopilot] DJ start pick error:', err);
     hideDJSplash();
+    await setStored({ running: false });
+    await chrome.storage.local.remove('djTabId');
     return null;
   }
 }
