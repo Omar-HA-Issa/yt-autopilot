@@ -737,13 +737,10 @@ async function pickNextNew(coldStartRetried = false) {
 }
 
 // ─── Cold-start fallback ───────────────────────────────────────────────────────
-// Fires only when pickNextNew() can't find a usable cluster yet (e.g. a brand-new
-// install's very first pick, before CLUSTER_K candidates have been embedded and
-// clustered). Embeds whatever's missing directly — awaited, bounded by
-// COLD_START_EMBED_TIMEOUT_MS — instead of the fire-and-forget EMBED_AND_STORE
-// path, then clusters once so pickNextNew() can retry with a real pool. The DJ
-// splash/cold-open narration is already showing during this window, so a few
-// seconds of extra wait on the very first pick is acceptable.
+// Fires only when pickNextNew() can't find a usable cluster yet (e.g. a
+// brand-new install's first pick). Embeds whatever's missing directly —
+// awaited, not the usual fire-and-forget EMBED_AND_STORE — then clusters once
+// so pickNextNew() can retry with a real pool.
 
 const COLD_START_EMBED_TIMEOUT_MS = 15000;
 
@@ -770,9 +767,8 @@ async function coldStartEmbedAndCluster() {
   console.log('[yt-autopilot] cold start: directly embedded', embedded, '/', unembedded.length, 'candidates');
 }
 
-// Last resort when clusters are still unusable after the cold-start embed retry —
-// weighted-random by channel score + view count only, no clustering or topics.
-// Should only ever fire on a fresh install's first pick.
+// Last resort if clusters are still unusable after the embed retry —
+// weighted-random by channel score + view count only, no clustering/topics.
 async function pickNextColdStart() {
   const [allCandidates, channelScores, recentPicks, rawWatched] = await Promise.all([
     getStored('ytap_candidates'),
@@ -893,10 +889,8 @@ const CONT_BUCKET_MAP = {
   film_tv: 'cont_filmtv',
 };
 
-// Resolves which bucket to play at a mid-session segment boundary, using
-// narrationLabel + narrationScore + confidence gate. The cold-start fallback
-// segment (pickNextColdStart) has no narrationLabel, so it always lands on
-// continuation_generic — same as a bucket with no files yet (during dev).
+// Segments with no narrationLabel (the cold-start fallback's segment shape,
+// or any bucket with no files yet) fall through to continuation_generic.
 function resolveContinuationBucket(seg) {
   if (!seg || seg.narrationLabel === undefined) return 'continuation_generic';
   if (seg.narrationScore >= NARRATION_CONFIDENCE_THRESHOLD) {
@@ -1524,13 +1518,9 @@ async function initAutoplay() {
 }
 
 // ─── DJ start ─────────────────────────────────────────────────────────────────
-// Shared by the PICK_NEXT message (normal start, content script already live)
-// and checkPendingStart() (start was deferred across a navigation/reload
-// because the content script wasn't injected yet when the popup tried). Both
-// callers set running: true themselves before calling this — pickNext() can
-// take 15s+ on a cold start, and the popup that triggered PICK_NEXT is long
-// gone by the time it resolves (it closes right after the ack), so running
-// can't depend on anything the popup does after sending the message.
+// Shared by the PICK_NEXT message and checkPendingStart(). Both callers set
+// running: true themselves before calling this — pickNext() can take 15s+ on
+// a cold start, and the popup is long closed by the time it resolves.
 
 async function runDjStartPick() {
   showDJSplash();
@@ -1553,13 +1543,9 @@ async function runDjStartPick() {
   }
 }
 
-// Picks up a start that the popup couldn't deliver directly — either the
-// active tab wasn't on YouTube (navigated here first) or it was on YouTube
-// but predated this content script's injection (e.g. extension reloaded
-// while the tab was already open). The popup sets djTabId + ytap_pending_start
-// and either navigates or reloads the tab; this runs once the resulting page
-// load re-injects content.js. Cleared unconditionally on read so a stale flag
-// never re-fires on a later unrelated load.
+// Resumes a start the popup couldn't deliver directly (non-YouTube tab, or a
+// stale content script) — popup.js sets djTabId + ytap_pending_start and
+// navigates/reloads the tab; this runs once that re-injects content.js.
 async function checkPendingStart() {
   const pending = await getStored('ytap_pending_start');
   if (!pending) return;
@@ -1581,17 +1567,14 @@ async function checkPendingStart() {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'PICK_NEXT') {
     console.log('[yt-autopilot] PICK_NEXT received');
-    // Ack immediately, before any work — the popup only needs to know delivery
-    // succeeded (to decide whether to reload instead) and then closes. Setting
-    // running here, not in the popup, means the DJ keeps going even if the
-    // popup closes (or the user clicks away) long before pickNext() resolves.
+    // Ack immediately — the popup just needs delivery confirmed, then closes.
     try { sendResponse({ ok: true }); } catch (_) {}
     (async () => {
       const myTabId = await getMyTabId();
       await setStored({ running: true, djTabId: myTabId });
       await runDjStartPick();
     })();
-    return; // sendResponse already fired synchronously above — nothing to keep open
+    return;
   }
 });
 

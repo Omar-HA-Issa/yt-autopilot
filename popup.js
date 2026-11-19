@@ -38,19 +38,11 @@ document.getElementById('resetBtn').addEventListener('click', () => {
 })();
 
 // ── Start / Stop ──────────────────────────────────────────────────────────────
-// Starting the DJ has three possible paths, in order of likelihood:
-//   1. Active tab is already on YouTube and its content script is live —
-//      sendMessage succeeds; content.js itself sets running once it acks.
-//   2. Active tab isn't on YouTube at all — navigate it there; content.js
-//      picks up ytap_pending_start once the resulting page load injects it.
-//   3. Active tab IS YouTube but sendMessage fails (content script missing —
-//      e.g. the tab predates installing/reloading the extension) — reload it;
-//      same ytap_pending_start pickup once it re-injects.
-// `running` is never set from here. Case 1's ack just confirms delivery — the
-// actual pick can take 15s+ on a cold start, and this popup is long closed by
-// then, so content.js sets running itself right after acking, not the popup.
-// Cases 2/3 defer the same way via ytap_pending_start. Either way, running
-// only flips once content.js has actually taken ownership of starting.
+// Three delivery paths: direct sendMessage (content script already live),
+// navigate-then-pending (active tab isn't YouTube), or reload-then-pending
+// (YouTube tab with a stale/missing content script). running is never set
+// here — content.js sets it itself in all three cases, since pickNext() can
+// take 15s+ and this popup is long closed by the time it would resolve.
 
 function isYouTubeUrl(url) {
   try { return new URL(url).hostname === 'www.youtube.com'; }
